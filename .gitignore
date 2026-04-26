@@ -1,0 +1,49 @@
+# Ignore everything by default
+*
+.*
+
+# Keep this file
+!.gitignore
+
+# Ignore the old imported project tree entirely
+14_ethernet_test/
+
+# Keep the new Vivado project container
+!FDED_Eth/
+!FDED_Eth/README.md
+!FDED_Eth/rebuild_FDED_Eth.tcl
+!FDED_Eth/FDED_Eth.xpr
+!FDED_Eth/FDED_Eth.srcs/
+!FDED_Eth/FDED_Eth.srcs/constrs_1/
+!FDED_Eth/FDED_Eth.srcs/constrs_1/new/
+!FDED_Eth/FDED_Eth.srcs/constrs_1/new/eth.xdc
+!FDED_Eth/FDED_Eth.srcs/sources_1/
+!FDED_Eth/FDED_Eth.srcs/sources_1/new/
+!FDED_Eth/FDED_Eth.srcs/sources_1/new/**
+!FDED_Eth/FDED_Eth.srcs/sources_1/ip/
+!FDED_Eth/FDED_Eth.srcs/sources_1/ip/**/*.xci
+
+# Ignore generated Vivado outputs inside the kept project
+FDED_Eth/FDED_Eth.cache/
+FDED_Eth/FDED_Eth.gen/
+FDED_Eth/FDED_Eth.hw/
+FDED_Eth/FDED_Eth.ip_user_files/
+FDED_Eth/FDED_Eth.runs/
+FDED_Eth/FDED_Eth.sim/
+FDED_Eth/FDED_Eth.srcs/utils_1/
+
+# Ignore generated artifacts if they appear elsewhere
+*.bit
+*.bin
+*.ltx
+*.dcp
+*.jou
+*.log
+*.pb
+*.rpt
+*.rpx
+*.vds
+*.wdb
+*.wcfg
+*.wdf
+*.wpc
