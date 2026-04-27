@@ -5,6 +5,9 @@ import struct
 import sys
 from typing import Iterable, List, Optional, Sequence, Tuple
 
+# python test_udp_sha256.py --suite
+
+
 
 DEFAULT_FPGA_IP = "192.168.0.2"
 DEFAULT_HOST_IP = "192.168.0.3"
