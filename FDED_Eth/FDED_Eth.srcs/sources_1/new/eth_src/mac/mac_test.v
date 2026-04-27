@@ -38,23 +38,31 @@ reg                  gmii_rx_dv_d0 ;
 reg   [7:0]          gmii_rxd_d0 ;
 
 reg                  reply_pending ;
-reg   [255:0]        hash_digest_buf ;
-reg                  hash_error_buf ;
+reg   [31:0]         seq_id_buf_tx ;
+reg   [255:0]        hash_digest_buf_tx ;
+reg                  hash_error_buf_tx ;
 reg   [5:0]          hash_write_cnt ;
 reg                  almost_full_d0 ;
 reg                  almost_full_d1 ;
-reg                  digest_capture_pending ;
-reg                  hash_done_toggle_tx_d0 ;
-reg                  hash_done_toggle_tx_d1 ;
 
 reg                  udp_rec_data_valid_d0_rx ;
 reg                  hash_start_rx ;
 reg   [15:0]         reply_payload_len_rx ;
-reg   [255:0]        hash_digest_buf_rx ;
-reg                  hash_error_buf_rx ;
-reg                  hash_done_toggle_rx ;
+
+reg   [31:0]         result_seq_id_rx ;
+reg   [255:0]        result_digest_rx ;
+reg                  result_error_rx ;
+reg                  result_toggle_rx ;
+reg                  result_busy_rx ;
+reg                  ack_toggle_rx_d0 ;
+reg                  ack_toggle_rx_d1 ;
+
+reg                  result_toggle_tx_d0 ;
+reg                  result_toggle_tx_d1 ;
+reg                  result_ack_toggle_tx ;
 
 wire [10:0]          sha_ram_read_addr ;
+wire [31:0]          sha_seq_id ;
 wire [255:0]         sha_digest ;
 wire                 sha_done ;
 wire                 sha_error ;
@@ -178,14 +186,23 @@ always@(posedge gmii_rx_clk or negedge rst_n)
         udp_rec_data_valid_d0_rx <= 1'b0 ;
         hash_start_rx            <= 1'b0 ;
         reply_payload_len_rx     <= 16'd0 ;
-        hash_digest_buf_rx       <= 256'd0 ;
-        hash_error_buf_rx        <= 1'b0 ;
-        hash_done_toggle_rx      <= 1'b0 ;
+        result_seq_id_rx         <= 32'd0 ;
+        result_digest_rx         <= 256'd0 ;
+        result_error_rx          <= 1'b0 ;
+        result_toggle_rx         <= 1'b0 ;
+        result_busy_rx           <= 1'b0 ;
+        ack_toggle_rx_d0         <= 1'b0 ;
+        ack_toggle_rx_d1         <= 1'b0 ;
       end
     else
       begin
         udp_rec_data_valid_d0_rx <= udp_rec_data_valid ;
         hash_start_rx <= 1'b0 ;
+        ack_toggle_rx_d0 <= result_ack_toggle_tx ;
+        ack_toggle_rx_d1 <= ack_toggle_rx_d0 ;
+
+        if (ack_toggle_rx_d0 ^ ack_toggle_rx_d1)
+          result_busy_rx <= 1'b0 ;
 
         if (udp_rec_data_valid && ~udp_rec_data_valid_d0_rx && ~sha_busy)
           begin
@@ -193,11 +210,13 @@ always@(posedge gmii_rx_clk or negedge rst_n)
             hash_start_rx <= 1'b1 ;
           end
 
-        if (sha_done)
+        if (sha_done && ~result_busy_rx)
           begin
-            hash_digest_buf_rx  <= sha_digest ;
-            hash_error_buf_rx   <= sha_error ;
-            hash_done_toggle_rx <= ~hash_done_toggle_rx ;
+            result_seq_id_rx <= sha_seq_id ;
+            result_digest_rx <= sha_digest ;
+            result_error_rx  <= sha_error ;
+            result_toggle_rx <= ~result_toggle_rx ;
+            result_busy_rx   <= 1'b1 ;
           end
       end
   end
@@ -206,33 +225,29 @@ always@(posedge gmii_tx_clk or negedge rst_n)
   begin
     if(rst_n == 1'b0)
       begin
-        reply_pending           <= 1'b0 ;
-        hash_digest_buf         <= 256'd0 ;
-        hash_error_buf          <= 1'b0 ;
-        digest_capture_pending  <= 1'b0 ;
-        hash_done_toggle_tx_d0  <= 1'b0 ;
-        hash_done_toggle_tx_d1  <= 1'b0 ;
+        reply_pending         <= 1'b0 ;
+        seq_id_buf_tx         <= 32'd0 ;
+        hash_digest_buf_tx    <= 256'd0 ;
+        hash_error_buf_tx     <= 1'b0 ;
+        result_toggle_tx_d0   <= 1'b0 ;
+        result_toggle_tx_d1   <= 1'b0 ;
+        result_ack_toggle_tx  <= 1'b0 ;
       end
     else
       begin
-        hash_done_toggle_tx_d0 <= hash_done_toggle_rx ;
-        hash_done_toggle_tx_d1 <= hash_done_toggle_tx_d0 ;
+        result_toggle_tx_d0 <= result_toggle_rx ;
+        result_toggle_tx_d1 <= result_toggle_tx_d0 ;
 
         if (state == WRITE_RAM && next_state == IDLE)
-          begin
-            reply_pending <= 1'b0 ;
-          end
+          reply_pending <= 1'b0 ;
 
-        if (hash_done_toggle_tx_d0 ^ hash_done_toggle_tx_d1)
+        if (result_toggle_tx_d0 ^ result_toggle_tx_d1)
           begin
-            digest_capture_pending <= 1'b1 ;
-          end
-        else if (digest_capture_pending)
-          begin
-            hash_digest_buf        <= hash_digest_buf_rx ;
-            hash_error_buf         <= hash_error_buf_rx ;
-            reply_pending          <= 1'b1 ;
-            digest_capture_pending <= 1'b0 ;
+            seq_id_buf_tx        <= result_seq_id_rx ;
+            hash_digest_buf_tx   <= result_digest_rx ;
+            hash_error_buf_tx    <= result_error_rx ;
+            reply_pending        <= 1'b1 ;
+            result_ack_toggle_tx <= ~result_ack_toggle_tx ;
           end
       end
   end
@@ -240,9 +255,9 @@ always@(posedge gmii_tx_clk or negedge rst_n)
 always@(posedge gmii_tx_clk or negedge rst_n)
   begin
     if(rst_n == 1'b0)
-      udp_send_data_length <= 16'd32 ;
+      udp_send_data_length <= 16'd36 ;
     else
-      udp_send_data_length <= 16'd32 ;
+      udp_send_data_length <= 16'd36 ;
   end
 
 always@(posedge gmii_tx_clk or negedge rst_n)
@@ -259,7 +274,7 @@ always@(posedge gmii_tx_clk or negedge rst_n)
   begin
     if(rst_n == 1'b0)
       ram_wr_en <= 1'b0 ;
-    else if (state == WRITE_RAM && hash_write_cnt < 6'd32)
+    else if (state == WRITE_RAM && hash_write_cnt < 6'd36)
       ram_wr_en <= 1'b1 ;
     else
       ram_wr_en <= 1'b0 ;
@@ -271,42 +286,46 @@ always@(posedge gmii_tx_clk or negedge rst_n)
       ram_wr_data <= 8'd0 ;
     else if (state == WRITE_RAM)
       begin
-        if (hash_error_buf)
+        if (hash_error_buf_tx)
           ram_wr_data <= 8'd0 ;
         else
           case (hash_write_cnt)
-            6'd0  : ram_wr_data <= hash_digest_buf[255:248] ;
-            6'd1  : ram_wr_data <= hash_digest_buf[247:240] ;
-            6'd2  : ram_wr_data <= hash_digest_buf[239:232] ;
-            6'd3  : ram_wr_data <= hash_digest_buf[231:224] ;
-            6'd4  : ram_wr_data <= hash_digest_buf[223:216] ;
-            6'd5  : ram_wr_data <= hash_digest_buf[215:208] ;
-            6'd6  : ram_wr_data <= hash_digest_buf[207:200] ;
-            6'd7  : ram_wr_data <= hash_digest_buf[199:192] ;
-            6'd8  : ram_wr_data <= hash_digest_buf[191:184] ;
-            6'd9  : ram_wr_data <= hash_digest_buf[183:176] ;
-            6'd10 : ram_wr_data <= hash_digest_buf[175:168] ;
-            6'd11 : ram_wr_data <= hash_digest_buf[167:160] ;
-            6'd12 : ram_wr_data <= hash_digest_buf[159:152] ;
-            6'd13 : ram_wr_data <= hash_digest_buf[151:144] ;
-            6'd14 : ram_wr_data <= hash_digest_buf[143:136] ;
-            6'd15 : ram_wr_data <= hash_digest_buf[135:128] ;
-            6'd16 : ram_wr_data <= hash_digest_buf[127:120] ;
-            6'd17 : ram_wr_data <= hash_digest_buf[119:112] ;
-            6'd18 : ram_wr_data <= hash_digest_buf[111:104] ;
-            6'd19 : ram_wr_data <= hash_digest_buf[103:96] ;
-            6'd20 : ram_wr_data <= hash_digest_buf[95:88] ;
-            6'd21 : ram_wr_data <= hash_digest_buf[87:80] ;
-            6'd22 : ram_wr_data <= hash_digest_buf[79:72] ;
-            6'd23 : ram_wr_data <= hash_digest_buf[71:64] ;
-            6'd24 : ram_wr_data <= hash_digest_buf[63:56] ;
-            6'd25 : ram_wr_data <= hash_digest_buf[55:48] ;
-            6'd26 : ram_wr_data <= hash_digest_buf[47:40] ;
-            6'd27 : ram_wr_data <= hash_digest_buf[39:32] ;
-            6'd28 : ram_wr_data <= hash_digest_buf[31:24] ;
-            6'd29 : ram_wr_data <= hash_digest_buf[23:16] ;
-            6'd30 : ram_wr_data <= hash_digest_buf[15:8] ;
-            6'd31 : ram_wr_data <= hash_digest_buf[7:0] ;
+            6'd0  : ram_wr_data <= seq_id_buf_tx[31:24] ;
+            6'd1  : ram_wr_data <= seq_id_buf_tx[23:16] ;
+            6'd2  : ram_wr_data <= seq_id_buf_tx[15:8] ;
+            6'd3  : ram_wr_data <= seq_id_buf_tx[7:0] ;
+            6'd4  : ram_wr_data <= hash_digest_buf_tx[255:248] ;
+            6'd5  : ram_wr_data <= hash_digest_buf_tx[247:240] ;
+            6'd6  : ram_wr_data <= hash_digest_buf_tx[239:232] ;
+            6'd7  : ram_wr_data <= hash_digest_buf_tx[231:224] ;
+            6'd8  : ram_wr_data <= hash_digest_buf_tx[223:216] ;
+            6'd9  : ram_wr_data <= hash_digest_buf_tx[215:208] ;
+            6'd10 : ram_wr_data <= hash_digest_buf_tx[207:200] ;
+            6'd11 : ram_wr_data <= hash_digest_buf_tx[199:192] ;
+            6'd12 : ram_wr_data <= hash_digest_buf_tx[191:184] ;
+            6'd13 : ram_wr_data <= hash_digest_buf_tx[183:176] ;
+            6'd14 : ram_wr_data <= hash_digest_buf_tx[175:168] ;
+            6'd15 : ram_wr_data <= hash_digest_buf_tx[167:160] ;
+            6'd16 : ram_wr_data <= hash_digest_buf_tx[159:152] ;
+            6'd17 : ram_wr_data <= hash_digest_buf_tx[151:144] ;
+            6'd18 : ram_wr_data <= hash_digest_buf_tx[143:136] ;
+            6'd19 : ram_wr_data <= hash_digest_buf_tx[135:128] ;
+            6'd20 : ram_wr_data <= hash_digest_buf_tx[127:120] ;
+            6'd21 : ram_wr_data <= hash_digest_buf_tx[119:112] ;
+            6'd22 : ram_wr_data <= hash_digest_buf_tx[111:104] ;
+            6'd23 : ram_wr_data <= hash_digest_buf_tx[103:96] ;
+            6'd24 : ram_wr_data <= hash_digest_buf_tx[95:88] ;
+            6'd25 : ram_wr_data <= hash_digest_buf_tx[87:80] ;
+            6'd26 : ram_wr_data <= hash_digest_buf_tx[79:72] ;
+            6'd27 : ram_wr_data <= hash_digest_buf_tx[71:64] ;
+            6'd28 : ram_wr_data <= hash_digest_buf_tx[63:56] ;
+            6'd29 : ram_wr_data <= hash_digest_buf_tx[55:48] ;
+            6'd30 : ram_wr_data <= hash_digest_buf_tx[47:40] ;
+            6'd31 : ram_wr_data <= hash_digest_buf_tx[39:32] ;
+            6'd32 : ram_wr_data <= hash_digest_buf_tx[31:24] ;
+            6'd33 : ram_wr_data <= hash_digest_buf_tx[23:16] ;
+            6'd34 : ram_wr_data <= hash_digest_buf_tx[15:8] ;
+            6'd35 : ram_wr_data <= hash_digest_buf_tx[7:0] ;
             default : ram_wr_data <= 8'd0 ;
           endcase
       end
@@ -314,7 +333,7 @@ always@(posedge gmii_tx_clk or negedge rst_n)
       ram_wr_data <= 8'd0 ;
   end
 
-assign write_ram_end = (state == WRITE_RAM && hash_write_cnt == 6'd32) ;
+assign write_ram_end = (state == WRITE_RAM && hash_write_cnt == 6'd36) ;
 
 always@(posedge gmii_tx_clk or negedge rst_n)
   begin
@@ -342,6 +361,7 @@ udp_sha256_oneblock sha256_oneblock_inst
  .payload_len    (reply_payload_len_rx),
  .ram_read_addr  (sha_ram_read_addr   ),
  .ram_read_data  (udp_rec_ram_rdata   ),
+ .seq_id         (sha_seq_id          ),
  .digest         (sha_digest          ),
  .done           (sha_done            ),
  .error          (sha_error           ),
