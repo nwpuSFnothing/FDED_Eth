@@ -20,6 +20,7 @@ localparam ST_BUILD_BLOCK = 3'd3;
 localparam ST_WAIT_READY  = 3'd4;
 localparam ST_SHA_START   = 3'd5;
 localparam ST_WAIT_DIGEST = 3'd6;
+localparam ST_READ_DONE   = 3'd7;
 
 reg [2:0] state;
 reg [15:0] payload_len_reg;
@@ -99,9 +100,14 @@ always @(posedge clk or negedge rst_n) begin
                 if (read_index + 1 < payload_len_reg) begin
                     read_index <= read_index + 1'b1;
                     ram_read_addr <= read_index + 1'b1;
+                    state <= ST_READ_SETUP;
                 end else begin
-                    state <= ST_BUILD_BLOCK;
+                    state <= ST_READ_DONE;
                 end
+            end
+
+            ST_READ_DONE: begin
+                state <= ST_BUILD_BLOCK;
             end
 
             ST_BUILD_BLOCK: begin
