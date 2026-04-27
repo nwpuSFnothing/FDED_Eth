@@ -286,48 +286,45 @@ always@(posedge gmii_tx_clk or negedge rst_n)
       ram_wr_data <= 8'd0 ;
     else if (state == WRITE_RAM)
       begin
-        if (hash_error_buf_tx)
-          ram_wr_data <= 8'd0 ;
-        else
-          case (hash_write_cnt)
-            6'd0  : ram_wr_data <= seq_id_buf_tx[31:24] ;
-            6'd1  : ram_wr_data <= seq_id_buf_tx[23:16] ;
-            6'd2  : ram_wr_data <= seq_id_buf_tx[15:8] ;
-            6'd3  : ram_wr_data <= seq_id_buf_tx[7:0] ;
-            6'd4  : ram_wr_data <= hash_digest_buf_tx[255:248] ;
-            6'd5  : ram_wr_data <= hash_digest_buf_tx[247:240] ;
-            6'd6  : ram_wr_data <= hash_digest_buf_tx[239:232] ;
-            6'd7  : ram_wr_data <= hash_digest_buf_tx[231:224] ;
-            6'd8  : ram_wr_data <= hash_digest_buf_tx[223:216] ;
-            6'd9  : ram_wr_data <= hash_digest_buf_tx[215:208] ;
-            6'd10 : ram_wr_data <= hash_digest_buf_tx[207:200] ;
-            6'd11 : ram_wr_data <= hash_digest_buf_tx[199:192] ;
-            6'd12 : ram_wr_data <= hash_digest_buf_tx[191:184] ;
-            6'd13 : ram_wr_data <= hash_digest_buf_tx[183:176] ;
-            6'd14 : ram_wr_data <= hash_digest_buf_tx[175:168] ;
-            6'd15 : ram_wr_data <= hash_digest_buf_tx[167:160] ;
-            6'd16 : ram_wr_data <= hash_digest_buf_tx[159:152] ;
-            6'd17 : ram_wr_data <= hash_digest_buf_tx[151:144] ;
-            6'd18 : ram_wr_data <= hash_digest_buf_tx[143:136] ;
-            6'd19 : ram_wr_data <= hash_digest_buf_tx[135:128] ;
-            6'd20 : ram_wr_data <= hash_digest_buf_tx[127:120] ;
-            6'd21 : ram_wr_data <= hash_digest_buf_tx[119:112] ;
-            6'd22 : ram_wr_data <= hash_digest_buf_tx[111:104] ;
-            6'd23 : ram_wr_data <= hash_digest_buf_tx[103:96] ;
-            6'd24 : ram_wr_data <= hash_digest_buf_tx[95:88] ;
-            6'd25 : ram_wr_data <= hash_digest_buf_tx[87:80] ;
-            6'd26 : ram_wr_data <= hash_digest_buf_tx[79:72] ;
-            6'd27 : ram_wr_data <= hash_digest_buf_tx[71:64] ;
-            6'd28 : ram_wr_data <= hash_digest_buf_tx[63:56] ;
-            6'd29 : ram_wr_data <= hash_digest_buf_tx[55:48] ;
-            6'd30 : ram_wr_data <= hash_digest_buf_tx[47:40] ;
-            6'd31 : ram_wr_data <= hash_digest_buf_tx[39:32] ;
-            6'd32 : ram_wr_data <= hash_digest_buf_tx[31:24] ;
-            6'd33 : ram_wr_data <= hash_digest_buf_tx[23:16] ;
-            6'd34 : ram_wr_data <= hash_digest_buf_tx[15:8] ;
-            6'd35 : ram_wr_data <= hash_digest_buf_tx[7:0] ;
-            default : ram_wr_data <= 8'd0 ;
-          endcase
+        case (hash_write_cnt)
+          6'd0  : ram_wr_data <= seq_id_buf_tx[31:24] ;
+          6'd1  : ram_wr_data <= seq_id_buf_tx[23:16] ;
+          6'd2  : ram_wr_data <= seq_id_buf_tx[15:8] ;
+          6'd3  : ram_wr_data <= seq_id_buf_tx[7:0] ;
+          6'd4  : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[255:248] ;
+          6'd5  : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[247:240] ;
+          6'd6  : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[239:232] ;
+          6'd7  : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[231:224] ;
+          6'd8  : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[223:216] ;
+          6'd9  : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[215:208] ;
+          6'd10 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[207:200] ;
+          6'd11 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[199:192] ;
+          6'd12 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[191:184] ;
+          6'd13 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[183:176] ;
+          6'd14 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[175:168] ;
+          6'd15 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[167:160] ;
+          6'd16 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[159:152] ;
+          6'd17 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[151:144] ;
+          6'd18 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[143:136] ;
+          6'd19 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[135:128] ;
+          6'd20 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[127:120] ;
+          6'd21 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[119:112] ;
+          6'd22 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[111:104] ;
+          6'd23 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[103:96] ;
+          6'd24 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[95:88] ;
+          6'd25 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[87:80] ;
+          6'd26 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[79:72] ;
+          6'd27 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[71:64] ;
+          6'd28 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[63:56] ;
+          6'd29 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[55:48] ;
+          6'd30 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[47:40] ;
+          6'd31 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[39:32] ;
+          6'd32 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[31:24] ;
+          6'd33 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[23:16] ;
+          6'd34 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[15:8] ;
+          6'd35 : ram_wr_data <= hash_error_buf_tx ? 8'd0 : hash_digest_buf_tx[7:0] ;
+          default : ram_wr_data <= 8'd0 ;
+        endcase
       end
     else
       ram_wr_data <= 8'd0 ;

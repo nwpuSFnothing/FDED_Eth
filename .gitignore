@@ -25,13 +25,14 @@
 !FDED_Eth/FDED_Eth.srcs/sources_1/ip/**/
 !FDED_Eth/FDED_Eth.srcs/sources_1/ip/**/*.xci
 
-# Keep local test scripts
+# Keep local test source files only
 !FDED_test/
-!FDED_test/**
+FDED_test/*
+!FDED_test/*.py
 
 # Keep conversation logs
-!log/
-!log/**
+!LOG/
+!LOG/**
 
 # Ignore generated Vivado outputs inside the kept project
 FDED_Eth/FDED_Eth.cache/
