@@ -1,0 +1,11 @@
+[project]
+name = "fded-host"
+version = "0.1.0"
+description = "Host-side CDC chunking, FPGA UDP hashing, and sqlite3 fingerprint indexing."
+requires-python = ">=3.10"
+dependencies = [
+    "fastcdc>=1.7,<2",
+]
+
+[tool.pyright]
+include = ["src", "main.py"]

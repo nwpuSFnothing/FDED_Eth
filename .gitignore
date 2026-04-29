@@ -30,6 +30,19 @@
 FDED_test/*
 !FDED_test/*.py
 
+# Keep host-side source files only
+!FDED_host/
+FDED_host/*
+!FDED_host/README.md
+!FDED_host/pyproject.toml
+!FDED_host/main.py
+!FDED_host/src/
+!FDED_host/src/**
+FDED_host/**/__pycache__/
+FDED_host/.idea/
+FDED_host/data/
+FDED_host/Result/
+
 # Keep conversation logs
 !LOG/
 !LOG/**
