@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterator
 
-from fastcdc import fastcdc
 @dataclass(frozen=True)
 class Chunk:
     index: int
@@ -31,6 +30,8 @@ def fastcdc_chunks(
     avg_size: int,
     max_size: int,
 ) -> Iterator[Chunk]:
+    from fastcdc import fastcdc
+
     if not (0 < min_size <= avg_size <= max_size):
         raise ValueError("expected 0 < min_size <= avg_size <= max_size")
 

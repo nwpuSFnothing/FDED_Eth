@@ -24,9 +24,18 @@ localparam ST_WAIT_READY      = 4'd5;
 localparam ST_SHA_START       = 4'd6;
 localparam ST_WAIT_BLOCK_DONE = 4'd7;
 localparam ST_HOT_LOOKUP_WAIT = 4'd8;
+localparam ST_CTRL_OP_SETUP   = 4'd9;
+localparam ST_CTRL_OP_READ    = 4'd10;
+localparam ST_CTRL_DATA_SETUP = 4'd11;
+localparam ST_CTRL_DATA_READ  = 4'd12;
+localparam ST_CTRL_APPLY      = 4'd13;
+localparam ST_CTRL_DONE       = 4'd14;
 
 localparam READ_SEQ   = 1'b0;
 localparam READ_BLOCK = 1'b1;
+localparam [31:0] CTRL_MAGIC = 32'h46444544; // "FDED"
+localparam [7:0]  CTRL_WRITE_SLOT = 8'h10;
+localparam [7:0]  CTRL_CLEAR      = 8'h11;
 
 reg  [3:0]   state;
 reg  [15:0]  hash_payload_len_reg;
@@ -42,6 +51,12 @@ reg          sha_valid;
 reg          sha_last;
 reg          sha_digest_valid_d0;
 reg          hot_lookup_start;
+reg          hot_cfg_we;
+reg          hot_cfg_clear;
+reg  [8:0]   hot_cfg_slot;
+reg  [255:0] hot_cfg_digest;
+reg  [7:0]   ctrl_op_reg;
+reg  [15:0]  ctrl_slot_reg;
 
 wire [255:0] sha_digest;
 wire         sha_digest_valid;
@@ -72,6 +87,10 @@ hot_digest_table #(
     .rst_n(rst_n),
     .start(hot_lookup_start),
     .digest(digest),
+    .cfg_we(hot_cfg_we),
+    .cfg_clear(hot_cfg_clear),
+    .cfg_slot(hot_cfg_slot),
+    .cfg_digest(hot_cfg_digest),
     .done(hot_lookup_done),
     .hit(hot_lookup_hit)
 );
@@ -94,6 +113,12 @@ always @(posedge clk or negedge rst_n) begin
         sha_last <= 1'b0;
         sha_digest_valid_d0 <= 1'b0;
         hot_lookup_start <= 1'b0;
+        hot_cfg_we <= 1'b0;
+        hot_cfg_clear <= 1'b0;
+        hot_cfg_slot <= 9'd0;
+        hot_cfg_digest <= 256'd0;
+        ctrl_op_reg <= 8'd0;
+        ctrl_slot_reg <= 16'd0;
         digest <= 256'd0;
         hot_hit <= 1'b0;
         done <= 1'b0;
@@ -103,6 +128,8 @@ always @(posedge clk or negedge rst_n) begin
         done <= 1'b0;
         sha_valid <= 1'b0;
         hot_lookup_start <= 1'b0;
+        hot_cfg_we <= 1'b0;
+        hot_cfg_clear <= 1'b0;
         sha_digest_valid_d0 <= sha_digest_valid;
 
         case (state)
@@ -169,7 +196,19 @@ always @(posedge clk or negedge rst_n) begin
             ST_PREP_BLOCK: begin
                 sha_block <= 512'd0;
 
-                if (block_index_reg < full_blocks_reg) begin
+                if (seq_id == CTRL_MAGIC) begin
+                    if (payload_len >= 16'd5) begin
+                        ram_read_addr <= 11'd4;
+                        state <= ST_CTRL_OP_SETUP;
+                    end else begin
+                        digest <= 256'd0;
+                        hot_hit <= 1'b0;
+                        error <= 1'b1;
+                        done <= 1'b1;
+                        busy <= 1'b0;
+                        state <= ST_IDLE;
+                    end
+                end else if (block_index_reg < full_blocks_reg) begin
                     read_mode_reg <= READ_BLOCK;
                     read_count_reg <= 7'd64;
                     read_index <= 7'd0;
@@ -200,6 +239,75 @@ always @(posedge clk or negedge rst_n) begin
                     block_is_last_reg <= 1'b1;
                     state <= ST_BUILD_BLOCK;
                 end
+            end
+
+            ST_CTRL_OP_SETUP: begin
+                state <= ST_CTRL_OP_READ;
+            end
+
+            ST_CTRL_OP_READ: begin
+                ctrl_op_reg <= ram_read_data;
+                digest <= 256'd0;
+                hot_hit <= 1'b0;
+
+                if (ram_read_data == CTRL_CLEAR) begin
+                    hot_cfg_clear <= 1'b1;
+                    error <= 1'b0;
+                    state <= ST_CTRL_DONE;
+                end else if (ram_read_data == CTRL_WRITE_SLOT && payload_len >= 16'd39) begin
+                    read_count_reg <= 7'd34;
+                    read_index <= 7'd0;
+                    ctrl_slot_reg <= 16'd0;
+                    hot_cfg_digest <= 256'd0;
+                    ram_read_addr <= 11'd5;
+                    state <= ST_CTRL_DATA_SETUP;
+                end else begin
+                    error <= 1'b1;
+                    done <= 1'b1;
+                    busy <= 1'b0;
+                    state <= ST_IDLE;
+                end
+            end
+
+            ST_CTRL_DATA_SETUP: begin
+                state <= ST_CTRL_DATA_READ;
+            end
+
+            ST_CTRL_DATA_READ: begin
+                if (read_index == 7'd0)
+                    ctrl_slot_reg[15:8] <= ram_read_data;
+                else if (read_index == 7'd1)
+                    ctrl_slot_reg[7:0] <= ram_read_data;
+                else
+                    hot_cfg_digest[255 - ((read_index - 7'd2) * 8) -: 8] <= ram_read_data;
+
+                if (read_index + 1 < read_count_reg) begin
+                    read_index <= read_index + 1'b1;
+                    ram_read_addr <= ram_read_addr + 1'b1;
+                    state <= ST_CTRL_DATA_SETUP;
+                end else begin
+                    state <= ST_CTRL_APPLY;
+                end
+            end
+
+            ST_CTRL_APPLY: begin
+                if (ctrl_slot_reg < 16'd512) begin
+                    hot_cfg_slot <= ctrl_slot_reg[8:0];
+                    hot_cfg_we <= 1'b1;
+                    error <= 1'b0;
+                end else begin
+                    error <= 1'b1;
+                end
+
+                digest <= 256'd0;
+                hot_hit <= 1'b0;
+                state <= ST_CTRL_DONE;
+            end
+
+            ST_CTRL_DONE: begin
+                done <= 1'b1;
+                busy <= 1'b0;
+                state <= ST_IDLE;
             end
 
             ST_BUILD_BLOCK: begin

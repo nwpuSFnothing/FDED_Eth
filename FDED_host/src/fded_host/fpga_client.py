@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .config import (
+    DIGEST_LEN,
     EXPECTED_REPLY_LEN,
     SEQ_ID_LEN,
     STATUS_ERROR,
@@ -14,6 +15,11 @@ from .config import (
     STATUS_LEN,
     STATUS_MISS,
 )
+
+CTRL_MAGIC = b"FDED"
+CTRL_MAGIC_SEQ = 0x46444544
+CTRL_WRITE_SLOT = 0x10
+CTRL_CLEAR = 0x11
 
 
 @dataclass(frozen=True)
@@ -83,7 +89,34 @@ class FpgaUdpClient:
         request = struct.pack(">I", seq_id) + payload
         self.sock.sendto(request, (self.fpga_ip, self.port))
         reply, _ = self.sock.recvfrom(4096)
+        return self._parse_reply(reply, expected_seq_id=seq_id)
 
+    def clear_hot_table(self) -> HashReply:
+        return self._control_request(CTRL_MAGIC + bytes([CTRL_CLEAR]))
+
+    def write_hot_digest(self, slot: int, digest: bytes) -> HashReply:
+        if not (0 <= slot <= 0xFFFF):
+            raise ValueError("slot must fit in 16 bits")
+        if len(digest) != DIGEST_LEN:
+            raise ValueError(f"digest must be {DIGEST_LEN} bytes")
+
+        payload = (
+            CTRL_MAGIC
+            + bytes([CTRL_WRITE_SLOT])
+            + struct.pack(">H", slot)
+            + digest
+        )
+        return self._control_request(payload)
+
+    def _control_request(self, payload: bytes) -> HashReply:
+        if self.sock is None:
+            raise RuntimeError("socket is not open")
+
+        self.sock.sendto(payload, (self.fpga_ip, self.port))
+        reply, _ = self.sock.recvfrom(4096)
+        return self._parse_reply(reply, expected_seq_id=CTRL_MAGIC_SEQ)
+
+    def _parse_reply(self, reply: bytes, expected_seq_id: int) -> HashReply:
         if len(reply) != EXPECTED_REPLY_LEN:
             raise ValueError(
                 f"expected {EXPECTED_REPLY_LEN}B FPGA reply, got {len(reply)}B"
@@ -93,15 +126,15 @@ class FpgaUdpClient:
         status = reply[SEQ_ID_LEN]
         digest_offset = SEQ_ID_LEN + STATUS_LEN
         digest = reply[digest_offset:]
-        if reply_seq != seq_id:
+        if reply_seq != expected_seq_id:
             raise ValueError(
-                f"expected reply seq_id 0x{seq_id:08x}, got 0x{reply_seq:08x}"
+                f"expected reply seq_id 0x{expected_seq_id:08x}, got 0x{reply_seq:08x}"
             )
         if status == STATUS_ERROR:
-            raise ValueError(f"FPGA returned error status for seq_id 0x{seq_id:08x}")
+            raise ValueError(f"FPGA returned error status for seq_id 0x{expected_seq_id:08x}")
         if status not in (STATUS_MISS, STATUS_HOT_HIT):
             raise ValueError(
-                f"unknown FPGA status 0x{status:02x} for seq_id 0x{seq_id:08x}"
+                f"unknown FPGA status 0x{status:02x} for seq_id 0x{expected_seq_id:08x}"
             )
         return HashReply(seq_id=reply_seq, status=status, digest=digest)
 

@@ -101,3 +101,17 @@ class FingerprintDb:
         self.conn.commit()
         return RecordResult(is_duplicate=is_duplicate, ref_count=ref_count)
 
+    def get_hot_digests(self, limit: int) -> list[tuple[bytes, int]]:
+        if limit <= 0:
+            return []
+
+        rows = self.conn.execute(
+            """
+            SELECT digest, ref_count
+            FROM fingerprints
+            ORDER BY ref_count DESC, updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [(bytes(row[0]), int(row[1])) for row in rows]

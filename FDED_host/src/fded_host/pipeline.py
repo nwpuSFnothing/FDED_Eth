@@ -6,7 +6,6 @@ from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Iterable
-from PIL import Image, ImageDraw, ImageFont
 
 from .chunker import Chunk, fastcdc_chunks, fixed_size_chunks
 from .config import (
@@ -101,6 +100,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     process_dir.add_argument("--result-dir", default=DEFAULT_RESULT_DIR)
     process_dir.add_argument("--result-tag", default=None)
     process_dir.add_argument("--write-dir", default=DEFAULT_WRITE_DIR)
+
+    load_hot = subparsers.add_parser("load-hot-table", help="Load top-N sqlite digests into the FPGA hot table.")
+    load_hot.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    load_hot.add_argument("--fpga-ip", default=DEFAULT_FPGA_IP)
+    load_hot.add_argument("--host-ip", default=DEFAULT_HOST_IP)
+    load_hot.add_argument("--port", type=int, default=DEFAULT_PORT)
+    load_hot.add_argument("--timeout", type=float, default=5.0)
+    load_hot.add_argument("--limit", type=int, default=512)
+    load_hot.add_argument("--no-clear", action="store_true")
+
+    clear_hot = subparsers.add_parser("clear-hot-table", help="Clear the FPGA hot digest table.")
+    clear_hot.add_argument("--fpga-ip", default=DEFAULT_FPGA_IP)
+    clear_hot.add_argument("--host-ip", default=DEFAULT_HOST_IP)
+    clear_hot.add_argument("--port", type=int, default=DEFAULT_PORT)
+    clear_hot.add_argument("--timeout", type=float, default=5.0)
+
+    write_hot = subparsers.add_parser("write-hot-digest", help="Write one digest into an FPGA hot table slot.")
+    write_hot.add_argument("--slot", type=int, required=True)
+    write_hot.add_argument("--digest-hex", required=True)
+    write_hot.add_argument("--fpga-ip", default=DEFAULT_FPGA_IP)
+    write_hot.add_argument("--host-ip", default=DEFAULT_HOST_IP)
+    write_hot.add_argument("--port", type=int, default=DEFAULT_PORT)
+    write_hot.add_argument("--timeout", type=float, default=5.0)
 
     return parser
 
@@ -266,6 +288,8 @@ def render_result_table_image(
     output_path: Path,
     args: argparse.Namespace,
 ) -> None:
+    from PIL import Image, ImageDraw, ImageFont
+
     title = "FDED_host Test Results"
     subtitle = (
         f"mode={args.chunk_mode} min={args.min_size} avg={args.avg_size} "
@@ -403,6 +427,61 @@ def process_dir(args: argparse.Namespace) -> int:
     return 0
 
 
+def load_hot_table(args: argparse.Namespace) -> int:
+    db = FingerprintDb(args.db_path)
+    try:
+        hot_digests = db.get_hot_digests(args.limit)
+    finally:
+        db.close()
+
+    with FpgaUdpClient(
+        fpga_ip=args.fpga_ip,
+        host_ip=args.host_ip,
+        port=args.port,
+        timeout=args.timeout,
+    ) as client:
+        if not args.no_clear:
+            client.clear_hot_table()
+            print("cleared hot table")
+
+        for slot, (digest, ref_count) in enumerate(hot_digests):
+            client.write_hot_digest(slot, digest)
+            print(f"slot={slot:04d} ref_count={ref_count} digest={digest.hex()}")
+
+    print(f"loaded {len(hot_digests)} hot digest(s)")
+    return 0
+
+
+def clear_hot_table(args: argparse.Namespace) -> int:
+    with FpgaUdpClient(
+        fpga_ip=args.fpga_ip,
+        host_ip=args.host_ip,
+        port=args.port,
+        timeout=args.timeout,
+    ) as client:
+        client.clear_hot_table()
+    print("cleared hot table")
+    return 0
+
+
+def write_hot_digest(args: argparse.Namespace) -> int:
+    try:
+        digest = bytes.fromhex(args.digest_hex)
+    except ValueError as exc:
+        raise SystemExit(f"invalid --digest-hex: {exc}") from exc
+
+    with FpgaUdpClient(
+        fpga_ip=args.fpga_ip,
+        host_ip=args.host_ip,
+        port=args.port,
+        timeout=args.timeout,
+    ) as client:
+        client.write_hot_digest(args.slot, digest)
+
+    print(f"wrote slot={args.slot} digest={digest.hex()}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -411,5 +490,11 @@ def main(argv: list[str] | None = None) -> int:
         return process_file(args)
     if args.command == "process-dir":
         return process_dir(args)
+    if args.command == "load-hot-table":
+        return load_hot_table(args)
+    if args.command == "clear-hot-table":
+        return clear_hot_table(args)
+    if args.command == "write-hot-digest":
+        return write_hot_digest(args)
     parser.error(f"unsupported command: {args.command}")
     return 2
