@@ -18,6 +18,7 @@ set rtl_files [list \
   [file join $origin_dir FDED_Eth.srcs sources_1 new eth_src arbi gmii_rx_buffer.v] \
   [file join $origin_dir FDED_Eth.srcs sources_1 new eth_src arbi gmii_tx_buffer.v] \
   [file join $origin_dir FDED_Eth.srcs sources_1 new eth_src mac icmp_reply.v] \
+  [file join $origin_dir FDED_Eth.srcs sources_1 new eth_src mac hot_digest_table.v] \
   [file join $origin_dir FDED_Eth.srcs sources_1 new eth_src mac rx ip_rx.v] \
   [file join $origin_dir FDED_Eth.srcs sources_1 new eth_src mac tx ip_tx.v] \
   [file join $origin_dir FDED_Eth.srcs sources_1 new eth_src mac tx ip_tx_mode.v] \

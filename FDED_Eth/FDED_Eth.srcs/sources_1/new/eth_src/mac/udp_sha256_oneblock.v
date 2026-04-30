@@ -9,6 +9,7 @@ module udp_sha256_oneblock (
     input  wire [7:0]   ram_read_data,
     output reg  [31:0]  seq_id,
     output reg  [255:0] digest,
+    output reg          hot_hit,
     output reg          done,
     output reg          error,
     output reg          busy
@@ -22,6 +23,7 @@ localparam ST_BUILD_BLOCK     = 4'd4;
 localparam ST_WAIT_READY      = 4'd5;
 localparam ST_SHA_START       = 4'd6;
 localparam ST_WAIT_BLOCK_DONE = 4'd7;
+localparam ST_HOT_LOOKUP_WAIT = 4'd8;
 
 localparam READ_SEQ   = 1'b0;
 localparam READ_BLOCK = 1'b1;
@@ -39,11 +41,14 @@ reg  [511:0] sha_block;
 reg          sha_valid;
 reg          sha_last;
 reg          sha_digest_valid_d0;
+reg          hot_lookup_start;
 
 wire [255:0] sha_digest;
 wire         sha_digest_valid;
 wire         sha_ready;
 wire [63:0]  hash_bit_len;
+wire         hot_lookup_done;
+wire         hot_lookup_hit;
 
 assign hash_bit_len = {45'd0, hash_payload_len_reg, 3'b000};
 
@@ -57,6 +62,18 @@ sha256_stream sha256_stream_inst (
     .s_tready_o(sha_ready),
     .digest_o(sha_digest),
     .digest_valid_o(sha_digest_valid)
+);
+
+hot_digest_table #(
+    .HOT_TABLE_DEPTH(512),
+    .HOT_ADDR_WIDTH(9)
+) hot_digest_table_inst (
+    .clk(clk),
+    .rst_n(rst_n),
+    .start(hot_lookup_start),
+    .digest(digest),
+    .done(hot_lookup_done),
+    .hit(hot_lookup_hit)
 );
 
 always @(posedge clk or negedge rst_n) begin
@@ -76,13 +93,16 @@ always @(posedge clk or negedge rst_n) begin
         sha_valid <= 1'b0;
         sha_last <= 1'b0;
         sha_digest_valid_d0 <= 1'b0;
+        hot_lookup_start <= 1'b0;
         digest <= 256'd0;
+        hot_hit <= 1'b0;
         done <= 1'b0;
         error <= 1'b0;
         busy <= 1'b0;
     end else begin
         done <= 1'b0;
         sha_valid <= 1'b0;
+        hot_lookup_start <= 1'b0;
         sha_digest_valid_d0 <= sha_digest_valid;
 
         case (state)
@@ -105,12 +125,14 @@ always @(posedge clk or negedge rst_n) begin
                         ram_read_addr <= 11'd0;
                         seq_id <= 32'd0;
                         digest <= 256'd0;
+                        hot_hit <= 1'b0;
                         sha_block <= 512'd0;
                         sha_last <= 1'b0;
                         state <= ST_READ_SETUP;
                     end else begin
                         seq_id <= 32'd0;
                         digest <= 256'd0;
+                        hot_hit <= 1'b0;
                         error <= 1'b1;
                         done <= 1'b1;
                     end
@@ -211,13 +233,21 @@ always @(posedge clk or negedge rst_n) begin
                 if (sha_digest_valid && ~sha_digest_valid_d0) begin
                     if (block_is_last_reg) begin
                         digest <= sha_digest;
-                        done <= 1'b1;
-                        busy <= 1'b0;
-                        state <= ST_IDLE;
+                        hot_lookup_start <= 1'b1;
+                        state <= ST_HOT_LOOKUP_WAIT;
                     end else begin
                         block_index_reg <= block_index_reg + 1'b1;
                         state <= ST_PREP_BLOCK;
                     end
+                end
+            end
+
+            ST_HOT_LOOKUP_WAIT: begin
+                if (hot_lookup_done) begin
+                    hot_hit <= hot_lookup_hit;
+                    done <= 1'b1;
+                    busy <= 1'b0;
+                    state <= ST_IDLE;
                 end
             end
 
