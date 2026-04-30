@@ -18,9 +18,13 @@ DEFAULT_PORT = 8080
 SEQ_ID_LEN = 4
 MAX_UDP_PAYLOAD_LEN = 2048
 MAX_DATA_LEN = MAX_UDP_PAYLOAD_LEN - SEQ_ID_LEN
+STATUS_LEN = 1
 DIGEST_LEN = 32
-EXPECTED_REPLY_LEN = SEQ_ID_LEN + DIGEST_LEN
+EXPECTED_REPLY_LEN = SEQ_ID_LEN + STATUS_LEN + DIGEST_LEN
 FLUSH_SEQ_ID = 0xFFFFFFFF
+STATUS_MISS = 0x00
+STATUS_HOT_HIT = 0x01
+STATUS_ERROR = 0x80
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,14 +111,15 @@ def build_request(seq_id: int, payload: bytes) -> bytes:
     return struct.pack(">I", seq_id) + payload
 
 
-def parse_reply(reply: bytes) -> Tuple[int, bytes]:
+def parse_reply(reply: bytes) -> Tuple[int, int, bytes]:
     if len(reply) != EXPECTED_REPLY_LEN:
         raise ValueError(
             f"expected {EXPECTED_REPLY_LEN}B reply, got {len(reply)}B"
         )
     seq_id = struct.unpack(">I", reply[:SEQ_ID_LEN])[0]
-    digest = reply[SEQ_ID_LEN:]
-    return seq_id, digest
+    status = reply[SEQ_ID_LEN]
+    digest = reply[SEQ_ID_LEN + STATUS_LEN:]
+    return seq_id, status, digest
 
 
 def expected_digest(payload: bytes) -> bytes:
@@ -159,18 +164,27 @@ def verify_reply(
 ) -> bool:
     print(f"recv   {len(reply)}B <- {addr[0]}:{addr[1]}")
     try:
-        reply_seq_id, reply_digest = parse_reply(reply)
+        reply_seq_id, reply_status, reply_digest = parse_reply(reply)
     except ValueError as exc:
         print(f"result fail: {exc}")
         return False
 
     print(f"r-seq  0x{reply_seq_id:08x}")
+    print(f"status 0x{reply_status:02x}")
     print(f"digest {reply_digest.hex()}")
 
     if reply_seq_id != expected_seq_id:
         print(
             f"result fail: expected seq 0x{expected_seq_id:08x}, got 0x{reply_seq_id:08x}"
         )
+        return False
+
+    if reply_status == STATUS_ERROR:
+        print("result fail: FPGA returned error status")
+        return False
+
+    if reply_status not in (STATUS_MISS, STATUS_HOT_HIT):
+        print(f"result fail: unknown FPGA status 0x{reply_status:02x}")
         return False
 
     if reply_digest != expected_digest(expected_payload):
@@ -225,8 +239,9 @@ def one_test_lag1(
     stale_reply, stale_addr = first_recv
     print(f"prime  {len(stale_reply)}B <- {stale_addr[0]}:{stale_addr[1]}")
     try:
-        stale_seq_id, stale_digest = parse_reply(stale_reply)
+        stale_seq_id, stale_status, stale_digest = parse_reply(stale_reply)
         print(f"p-seq  0x{stale_seq_id:08x}")
+        print(f"p-sts  0x{stale_status:02x}")
         print(f"p-dig  {stale_digest.hex()}")
     except ValueError as exc:
         print(f"prime  invalid reply: {exc}")
@@ -336,8 +351,9 @@ def run_suite_lag1(args: argparse.Namespace, cases: Sequence[Tuple[str, bytes]])
         stale_reply, stale_addr = primer_recv
         print(f"prime  {len(stale_reply)}B <- {stale_addr[0]}:{stale_addr[1]}")
         try:
-            stale_seq_id, stale_digest = parse_reply(stale_reply)
+            stale_seq_id, stale_status, stale_digest = parse_reply(stale_reply)
             print(f"p-seq  0x{stale_seq_id:08x}")
+            print(f"p-sts  0x{stale_status:02x}")
             print(f"p-dig  {stale_digest.hex()}")
         except ValueError as exc:
             print(f"prime  invalid reply: {exc}")

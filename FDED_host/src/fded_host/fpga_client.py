@@ -6,13 +6,25 @@ import struct
 from dataclasses import dataclass
 from typing import Optional
 
-from .config import EXPECTED_REPLY_LEN, SEQ_ID_LEN
+from .config import (
+    EXPECTED_REPLY_LEN,
+    SEQ_ID_LEN,
+    STATUS_ERROR,
+    STATUS_HOT_HIT,
+    STATUS_LEN,
+    STATUS_MISS,
+)
 
 
 @dataclass(frozen=True)
 class HashReply:
     seq_id: int
+    status: int
     digest: bytes
+
+    @property
+    def hot_hit(self) -> bool:
+        return self.status == STATUS_HOT_HIT
 
 
 class FpgaUdpClient:
@@ -78,14 +90,21 @@ class FpgaUdpClient:
             )
 
         reply_seq = struct.unpack(">I", reply[:SEQ_ID_LEN])[0]
-        digest = reply[SEQ_ID_LEN:]
+        status = reply[SEQ_ID_LEN]
+        digest_offset = SEQ_ID_LEN + STATUS_LEN
+        digest = reply[digest_offset:]
         if reply_seq != seq_id:
             raise ValueError(
                 f"expected reply seq_id 0x{seq_id:08x}, got 0x{reply_seq:08x}"
             )
-        return HashReply(seq_id=reply_seq, digest=digest)
+        if status == STATUS_ERROR:
+            raise ValueError(f"FPGA returned error status for seq_id 0x{seq_id:08x}")
+        if status not in (STATUS_MISS, STATUS_HOT_HIT):
+            raise ValueError(
+                f"unknown FPGA status 0x{status:02x} for seq_id 0x{seq_id:08x}"
+            )
+        return HashReply(seq_id=reply_seq, status=status, digest=digest)
 
     @staticmethod
     def expected_digest(payload: bytes) -> bytes:
         return hashlib.sha256(payload).digest()
-
