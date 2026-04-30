@@ -43,12 +43,23 @@ class ProcessStats:
     verify_seconds: float = 0.0
     db_seconds: float = 0.0
     write_seconds: float = 0.0
+    fpga_hot_hits: int = 0
+    host_lookups: int = 0
+    host_lookup_avoided: int = 0
+    hot_table_loaded: int = 0
+    hot_table_refreshes: int = 0
 
     @property
     def duplicate_ratio(self) -> float:
         if self.total_chunks == 0:
             return 0.0
         return self.duplicate_chunks / self.total_chunks
+
+    @property
+    def hot_hit_ratio(self) -> float:
+        if self.total_chunks == 0:
+            return 0.0
+        return self.fpga_hot_hits / self.total_chunks
 
 
 @dataclass(frozen=True)
@@ -75,6 +86,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     process.add_argument("--max-size", type=int, default=DEFAULT_MAX_CHUNK_SIZE)
     process.add_argument("--start-seq", type=lambda value: int(value, 0), default=1)
     process.add_argument("--verify-local", action="store_true")
+    process.add_argument("--load-hot-table", action="store_true")
+    process.add_argument("--hot-limit", type=int, default=512)
+    process.add_argument("--hot-refresh-interval-s", type=float, default=0.0)
+    process.add_argument("--no-clear-hot-table", action="store_true")
+    process.add_argument("--verify-hot-hit", action="store_true")
     process.add_argument("--print-chunks", action="store_true")
     process.add_argument("--result-dir", default=DEFAULT_RESULT_DIR)
     process.add_argument("--result-tag", default=None)
@@ -96,6 +112,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     process_dir.add_argument("--max-size", type=int, default=DEFAULT_MAX_CHUNK_SIZE)
     process_dir.add_argument("--start-seq", type=lambda value: int(value, 0), default=1)
     process_dir.add_argument("--verify-local", action="store_true")
+    process_dir.add_argument("--load-hot-table", action="store_true")
+    process_dir.add_argument("--hot-limit", type=int, default=512)
+    process_dir.add_argument("--hot-refresh-interval-s", type=float, default=0.0)
+    process_dir.add_argument("--no-clear-hot-table", action="store_true")
+    process_dir.add_argument("--verify-hot-hit", action="store_true")
     process_dir.add_argument("--print-chunks", action="store_true")
     process_dir.add_argument("--result-dir", default=DEFAULT_RESULT_DIR)
     process_dir.add_argument("--result-tag", default=None)
@@ -163,7 +184,24 @@ def write_unique_chunk(write_root: str, digest: bytes, data: bytes) -> int:
     return len(data)
 
 
-def process_one_file(args: argparse.Namespace, input_path: Path, db: FingerprintDb) -> ProcessStats:
+def reload_hot_table(
+    args: argparse.Namespace,
+    db: FingerprintDb,
+    client: FpgaUdpClient,
+) -> int:
+    hot_digests = [digest for digest, _ref_count in db.get_hot_digests(args.hot_limit)]
+    return client.load_hot_table(
+        hot_digests,
+        clear=not args.no_clear_hot_table,
+    )
+
+
+def process_one_file(
+    args: argparse.Namespace,
+    input_path: Path,
+    db: FingerprintDb,
+    load_hot_table: bool = True,
+) -> ProcessStats:
     read_t0 = perf_counter()
     data = input_path.read_bytes()
     read_t1 = perf_counter()
@@ -191,12 +229,30 @@ def process_one_file(args: argparse.Namespace, input_path: Path, db: Fingerprint
         timeout=args.timeout,
         max_data_len=args.max_size,
     ) as client:
+        if load_hot_table and args.load_hot_table:
+            stats.hot_table_loaded = reload_hot_table(args, db, client)
+            stats.hot_table_refreshes += 1
+
+        last_hot_refresh = perf_counter()
+
         for chunk in chunks:
+            if (
+                args.load_hot_table
+                and args.hot_refresh_interval_s > 0
+                and perf_counter() - last_hot_refresh >= args.hot_refresh_interval_s
+            ):
+                stats.hot_table_loaded = reload_hot_table(args, db, client)
+                stats.hot_table_refreshes += 1
+                last_hot_refresh = perf_counter()
+
             seq_id = args.start_seq + chunk.index
             fpga_t0 = perf_counter()
             reply = client.hash_chunk(seq_id, chunk.data)
             fpga_t1 = perf_counter()
             stats.fpga_seconds += fpga_t1 - fpga_t0
+            if reply.hot_hit:
+                stats.fpga_hot_hits += 1
+
             if args.verify_local:
                 verify_t0 = perf_counter()
                 local_digest = client.expected_digest(chunk.data)
@@ -208,13 +264,31 @@ def process_one_file(args: argparse.Namespace, input_path: Path, db: Fingerprint
                 stats.verify_seconds += verify_t1 - verify_t0
 
             db_t0 = perf_counter()
-            record = db.record_digest(
-                digest=reply.digest,
-                chunk_length=chunk.length,
-                source_path=str(input_path),
-                chunk_index=chunk.index,
-                chunk_offset=chunk.offset,
-            )
+            if reply.hot_hit:
+                if args.verify_hot_hit:
+                    stats.host_lookups += 1
+                    if not db.has_digest(reply.digest):
+                        raise ValueError(
+                            f"chunk {chunk.index} FPGA HOT_HIT digest is absent from sqlite"
+                        )
+                else:
+                    stats.host_lookup_avoided += 1
+                record = db.record_trusted_duplicate(
+                    digest=reply.digest,
+                    chunk_length=chunk.length,
+                    source_path=str(input_path),
+                    chunk_index=chunk.index,
+                    chunk_offset=chunk.offset,
+                )
+            else:
+                stats.host_lookups += 1
+                record = db.record_digest(
+                    digest=reply.digest,
+                    chunk_length=chunk.length,
+                    source_path=str(input_path),
+                    chunk_index=chunk.index,
+                    chunk_offset=chunk.offset,
+                )
             db_t1 = perf_counter()
             stats.db_seconds += db_t1 - db_t0
             stats.total_chunks += 1
@@ -230,9 +304,10 @@ def process_one_file(args: argparse.Namespace, input_path: Path, db: Fingerprint
 
             if args.print_chunks:
                 status = "dup" if record.is_duplicate else "new"
+                hot_status = "hot" if reply.hot_hit else "miss"
                 print(
                     f"chunk={chunk.index:04d} offset={chunk.offset:08d} "
-                    f"len={chunk.length:04d} seq=0x{seq_id:08x} {status} "
+                    f"len={chunk.length:04d} seq=0x{seq_id:08x} {hot_status} {status} "
                     f"ref_count={record.ref_count} digest={reply.digest.hex()}"
                 )
 
@@ -260,15 +335,23 @@ def write_result_tables(
         handle.write(f"- `port`: `{args.port}`\n")
         handle.write(f"- `timeout`: `{args.timeout}`\n")
         handle.write(f"- `verify_local`: `{args.verify_local}`\n\n")
+        handle.write(f"- `load_hot_table`: `{args.load_hot_table}`\n")
+        handle.write(f"- `hot_limit`: `{args.hot_limit}`\n")
+        handle.write(f"- `hot_refresh_interval_s`: `{args.hot_refresh_interval_s}`\n")
+        handle.write(f"- `verify_hot_hit`: `{args.verify_hot_hit}`\n")
         handle.write(f"- `write_dir`: `{args.write_dir}`\n\n")
         handle.write("## Results\n\n")
-        handle.write("| input_path | bytes | chunks | unique | duplicate | unique_write_bytes | duplicate_ratio | elapsed_s | read_s | chunk_s | fpga_s | verify_s | db_s | write_s |\n")
-        handle.write("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        handle.write("| input_path | bytes | chunks | unique | duplicate | unique_write_bytes | duplicate_ratio | fpga_hot_hits | host_lookups | lookup_avoided | hot_hit_ratio | hot_loaded | hot_refreshes | elapsed_s | read_s | chunk_s | fpga_s | verify_s | db_s | write_s |\n")
+        handle.write("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
         for stats in stats_list:
             handle.write(
                 f"| {stats.input_path} | {stats.total_bytes} | {stats.total_chunks} | "
                 f"{stats.unique_chunks} | {stats.duplicate_chunks} | {stats.written_unique_bytes} | "
-                f"{stats.duplicate_ratio:.4f} | {stats.elapsed_seconds:.4f} | "
+                f"{stats.duplicate_ratio:.4f} | {stats.fpga_hot_hits} | "
+                f"{stats.host_lookups} | {stats.host_lookup_avoided} | "
+                f"{stats.hot_hit_ratio:.4f} | {stats.hot_table_loaded} | "
+                f"{stats.hot_table_refreshes} | "
+                f"{stats.elapsed_seconds:.4f} | "
                 f"{stats.read_seconds:.4f} | {stats.chunk_seconds:.4f} | "
                 f"{stats.fpga_seconds:.4f} | {stats.verify_seconds:.4f} | "
                 f"{stats.db_seconds:.4f} | {stats.write_seconds:.4f} |\n"
@@ -295,7 +378,7 @@ def render_result_table_image(
         f"mode={args.chunk_mode} min={args.min_size} avg={args.avg_size} "
         f"max={args.max_size} fpga={args.fpga_ip}:{args.port} write={args.write_dir}"
     )
-    headers = ["file", "bytes", "chunks", "unique", "dup", "write_B", "dup_ratio", "elapsed_s", "fpga_s", "db_s", "write_s"]
+    headers = ["file", "bytes", "chunks", "unique", "dup", "write_B", "dup_ratio", "hot", "lookups", "saved", "hot_ratio", "loads", "elapsed_s", "fpga_s", "db_s", "write_s"]
     rows = []
     for stats in stats_list:
         rows.append(
@@ -307,6 +390,11 @@ def render_result_table_image(
                 str(stats.duplicate_chunks),
                 str(stats.written_unique_bytes),
                 f"{stats.duplicate_ratio:.4f}",
+                str(stats.fpga_hot_hits),
+                str(stats.host_lookups),
+                str(stats.host_lookup_avoided),
+                f"{stats.hot_hit_ratio:.4f}",
+                str(stats.hot_table_refreshes),
                 f"{stats.elapsed_seconds:.4f}",
                 f"{stats.fpga_seconds:.4f}",
                 f"{stats.db_seconds:.4f}",
@@ -378,6 +466,12 @@ def print_stats(stats: ProcessStats) -> None:
     print(f"duplicate     {stats.duplicate_chunks}")
     print(f"write_bytes   {stats.written_unique_bytes}")
     print(f"dup_ratio     {stats.duplicate_ratio:.4f}")
+    print(f"fpga_hot_hits {stats.fpga_hot_hits}")
+    print(f"host_lookups  {stats.host_lookups}")
+    print(f"lookup_saved  {stats.host_lookup_avoided}")
+    print(f"hot_hit_ratio {stats.hot_hit_ratio:.4f}")
+    print(f"hot_loaded    {stats.hot_table_loaded}")
+    print(f"hot_refreshes {stats.hot_table_refreshes}")
     print(f"elapsed_s     {stats.elapsed_seconds:.4f}")
     print(f"read_s        {stats.read_seconds:.4f}")
     print(f"chunk_s       {stats.chunk_seconds:.4f}")
@@ -412,9 +506,24 @@ def process_dir(args: argparse.Namespace) -> int:
     db = FingerprintDb(args.db_path)
     stats_list: list[ProcessStats] = []
     try:
+        hot_table_loaded = 0
+        hot_table_refreshes = 0
+        if args.load_hot_table:
+            with FpgaUdpClient(
+                fpga_ip=args.fpga_ip,
+                host_ip=args.host_ip,
+                port=args.port,
+                timeout=args.timeout,
+            ) as client:
+                hot_table_loaded = reload_hot_table(args, db, client)
+                hot_table_refreshes = 1
+
         for file_path in files:
             print(f"\n=== processing {file_path.name} ===")
-            stats = process_one_file(args, file_path, db)
+            stats = process_one_file(args, file_path, db, load_hot_table=False)
+            if stats.hot_table_loaded == 0:
+                stats.hot_table_loaded = hot_table_loaded
+            stats.hot_table_refreshes += hot_table_refreshes
             print_stats(stats)
             stats_list.append(stats)
     finally:

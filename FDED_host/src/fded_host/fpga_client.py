@@ -4,7 +4,7 @@ import hashlib
 import socket
 import struct
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional
 
 from .config import (
     DIGEST_LEN,
@@ -107,6 +107,16 @@ class FpgaUdpClient:
             + digest
         )
         return self._control_request(payload)
+
+    def load_hot_table(self, digests: Iterable[bytes], clear: bool = True) -> int:
+        if clear:
+            self.clear_hot_table()
+
+        loaded = 0
+        for slot, digest in enumerate(digests):
+            self.write_hot_digest(slot, digest)
+            loaded += 1
+        return loaded
 
     def _control_request(self, payload: bytes) -> HashReply:
         if self.sock is None:

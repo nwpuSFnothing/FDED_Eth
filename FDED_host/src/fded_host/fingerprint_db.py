@@ -101,6 +101,48 @@ class FingerprintDb:
         self.conn.commit()
         return RecordResult(is_duplicate=is_duplicate, ref_count=ref_count)
 
+    def has_digest(self, digest: bytes) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM fingerprints WHERE digest = ?",
+            (digest,),
+        ).fetchone()
+        return row is not None
+
+    def record_trusted_duplicate(
+        self,
+        digest: bytes,
+        chunk_length: int,
+        source_path: str,
+        chunk_index: int,
+        chunk_offset: int,
+    ) -> RecordResult:
+        row = self.conn.execute(
+            """
+            UPDATE fingerprints
+            SET ref_count = ref_count + 1, updated_at = CURRENT_TIMESTAMP
+            WHERE digest = ?
+            RETURNING ref_count
+            """,
+            (digest,),
+        ).fetchone()
+        if row is None:
+            self.conn.rollback()
+            raise KeyError(
+                "FPGA reported HOT_HIT, but digest was not present in sqlite fingerprint table"
+            )
+
+        ref_count = int(row[0])
+        self.conn.execute(
+            """
+            INSERT INTO chunk_events (
+                source_path, chunk_index, chunk_offset, chunk_length, digest, is_duplicate
+            ) VALUES (?, ?, ?, ?, ?, 1)
+            """,
+            (source_path, chunk_index, chunk_offset, chunk_length, digest),
+        )
+        self.conn.commit()
+        return RecordResult(is_duplicate=True, ref_count=ref_count)
+
     def get_hot_digests(self, limit: int) -> list[tuple[bytes, int]]:
         if limit <= 0:
             return []

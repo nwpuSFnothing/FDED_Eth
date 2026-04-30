@@ -29,6 +29,9 @@
 !FDED_test/
 FDED_test/*
 !FDED_test/*.py
+FDED_test/.idea/
+FDED_test/**/__pycache__/
+FDED_test/**/*.pyc
 
 # Keep host-side source files only
 !FDED_host/
@@ -46,6 +49,9 @@ FDED_host/Result/
 # Keep conversation logs
 !LOG/
 !LOG/**
+
+# Keep root-level project reference docs
+!工程使用与测试指令参考.md
 
 # Ignore generated Vivado outputs inside the kept project
 FDED_Eth/FDED_Eth.cache/
