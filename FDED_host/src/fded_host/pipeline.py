@@ -25,6 +25,7 @@ from .fpga_client import FpgaUdpClient
 
 @dataclass
 class ProcessStats:
+    run_id: int = 0
     input_path: str = ""
     chunk_mode: str = ""
     min_size: int = 0
@@ -145,6 +146,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     write_hot.add_argument("--port", type=int, default=DEFAULT_PORT)
     write_hot.add_argument("--timeout", type=float, default=5.0)
 
+    list_runs = subparsers.add_parser("list-runs", help="List recorded file processing runs.")
+    list_runs.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    list_runs.add_argument("--limit", type=int, default=20)
+
+    restore = subparsers.add_parser("restore-file", help="Restore one processed file from chunk storage.")
+    restore.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    restore.add_argument("--run-id", type=int, default=None)
+    restore.add_argument("--source-path", default=None)
+    restore.add_argument("--output-file", required=True)
+    restore.add_argument("--write-dir", default=DEFAULT_WRITE_DIR)
+
     return parser
 
 
@@ -221,6 +233,16 @@ def process_one_file(
     chunks = list(iter_chunks(args, input_path, data))
     chunk_t1 = perf_counter()
     stats.chunk_seconds = chunk_t1 - chunk_t0
+    stats.run_id = db.create_file_run(
+        source_path=str(input_path),
+        total_bytes=len(data),
+        chunk_count=len(chunks),
+        chunk_mode=args.chunk_mode,
+        min_size=args.min_size,
+        avg_size=args.avg_size,
+        max_size=args.max_size,
+        fixed_size=args.fixed_size,
+    )
 
     with FpgaUdpClient(
         fpga_ip=args.fpga_ip,
@@ -279,6 +301,7 @@ def process_one_file(
                     source_path=str(input_path),
                     chunk_index=chunk.index,
                     chunk_offset=chunk.offset,
+                    run_id=stats.run_id,
                 )
             else:
                 stats.host_lookups += 1
@@ -288,6 +311,7 @@ def process_one_file(
                     source_path=str(input_path),
                     chunk_index=chunk.index,
                     chunk_offset=chunk.offset,
+                    run_id=stats.run_id,
                 )
             db_t1 = perf_counter()
             stats.db_seconds += db_t1 - db_t0
@@ -341,11 +365,11 @@ def write_result_tables(
         handle.write(f"- `verify_hot_hit`: `{args.verify_hot_hit}`\n")
         handle.write(f"- `write_dir`: `{args.write_dir}`\n\n")
         handle.write("## Results\n\n")
-        handle.write("| input_path | bytes | chunks | unique | duplicate | unique_write_bytes | duplicate_ratio | fpga_hot_hits | host_lookups | lookup_avoided | hot_hit_ratio | hot_loaded | hot_refreshes | elapsed_s | read_s | chunk_s | fpga_s | verify_s | db_s | write_s |\n")
-        handle.write("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        handle.write("| run_id | input_path | bytes | chunks | unique | duplicate | unique_write_bytes | duplicate_ratio | fpga_hot_hits | host_lookups | lookup_avoided | hot_hit_ratio | hot_loaded | hot_refreshes | elapsed_s | read_s | chunk_s | fpga_s | verify_s | db_s | write_s |\n")
+        handle.write("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
         for stats in stats_list:
             handle.write(
-                f"| {stats.input_path} | {stats.total_bytes} | {stats.total_chunks} | "
+                f"| {stats.run_id} | {stats.input_path} | {stats.total_bytes} | {stats.total_chunks} | "
                 f"{stats.unique_chunks} | {stats.duplicate_chunks} | {stats.written_unique_bytes} | "
                 f"{stats.duplicate_ratio:.4f} | {stats.fpga_hot_hits} | "
                 f"{stats.host_lookups} | {stats.host_lookup_avoided} | "
@@ -459,6 +483,7 @@ def render_result_table_image(
 
 
 def print_stats(stats: ProcessStats) -> None:
+    print(f"run_id        {stats.run_id}")
     print(f"file          {stats.input_path}")
     print(f"bytes         {stats.total_bytes}")
     print(f"chunks        {stats.total_chunks}")
@@ -591,6 +616,76 @@ def write_hot_digest(args: argparse.Namespace) -> int:
     return 0
 
 
+def list_runs(args: argparse.Namespace) -> int:
+    db = FingerprintDb(args.db_path)
+    try:
+        runs = db.list_file_runs(args.limit)
+    finally:
+        db.close()
+
+    print("run_id  chunks  bytes      mode   created_at           source_path")
+    for run in runs:
+        print(
+            f"{run.id:<7} {run.chunk_count:<7} {run.total_bytes:<10} "
+            f"{run.chunk_mode:<6} {run.created_at:<19} {run.source_path}"
+        )
+    return 0
+
+
+def restore_file(args: argparse.Namespace) -> int:
+    if args.run_id is None and args.source_path is None:
+        raise SystemExit("restore-file requires --run-id or --source-path")
+    if args.run_id is not None and args.source_path is not None:
+        raise SystemExit("use only one of --run-id or --source-path")
+
+    db = FingerprintDb(args.db_path)
+    try:
+        if args.run_id is not None:
+            file_run = db.get_file_run(args.run_id)
+        else:
+            source_path = str(Path(args.source_path).resolve())
+            file_run = db.get_latest_file_run(source_path)
+        chunks = db.get_run_chunks(file_run.id)
+    finally:
+        db.close()
+
+    if len(chunks) != file_run.chunk_count:
+        raise ValueError(
+            f"run {file_run.id} expected {file_run.chunk_count} chunk event(s), got {len(chunks)}"
+        )
+
+    chunk_dir = Path(args.write_dir).resolve() / "chunks"
+    output_path = Path(args.output_file).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    restored_bytes = 0
+
+    with output_path.open("wb") as output:
+        for chunk in chunks:
+            chunk_path = chunk_dir / f"{chunk.digest.hex()}.bin"
+            if not chunk_path.exists():
+                raise FileNotFoundError(f"missing chunk data file: {chunk_path}")
+            data = chunk_path.read_bytes()
+            if len(data) != chunk.chunk_length:
+                raise ValueError(
+                    f"chunk {chunk.chunk_index} length mismatch: "
+                    f"metadata={chunk.chunk_length}, file={len(data)}"
+                )
+            output.write(data)
+            restored_bytes += len(data)
+
+    if restored_bytes != file_run.total_bytes:
+        raise ValueError(
+            f"restored byte count mismatch: metadata={file_run.total_bytes}, restored={restored_bytes}"
+        )
+
+    print(f"restored_run  {file_run.id}")
+    print(f"source_file   {file_run.source_path}")
+    print(f"output_file   {output_path}")
+    print(f"bytes         {restored_bytes}")
+    print(f"chunks        {len(chunks)}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -605,5 +700,9 @@ def main(argv: list[str] | None = None) -> int:
         return clear_hot_table(args)
     if args.command == "write-hot-digest":
         return write_hot_digest(args)
+    if args.command == "list-runs":
+        return list_runs(args)
+    if args.command == "restore-file":
+        return restore_file(args)
     parser.error(f"unsupported command: {args.command}")
     return 2
