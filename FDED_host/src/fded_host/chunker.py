@@ -34,6 +34,8 @@ def fastcdc_chunks(
 
     if not (0 < min_size <= avg_size <= max_size):
         raise ValueError("expected 0 < min_size <= avg_size <= max_size")
+    if not data:
+        return
 
     for index, chunk in enumerate(fastcdc(file_path, min_size, avg_size, max_size)):
         offset = int(chunk.offset)
