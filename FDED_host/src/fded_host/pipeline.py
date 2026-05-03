@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import struct
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +13,7 @@ from .chunker import Chunk, fastcdc_chunks, fixed_size_chunks
 from .config import (
     DEFAULT_AVG_CHUNK_SIZE,
     DEFAULT_DB_PATH,
+    DEFAULT_FRAGMENT_SIZE,
     DEFAULT_FPGA_IP,
     DEFAULT_HOST_IP,
     DEFAULT_MAX_CHUNK_SIZE,
@@ -49,6 +52,10 @@ class ProcessStats:
     host_lookup_avoided: int = 0
     hot_table_loaded: int = 0
     hot_table_refreshes: int = 0
+    digest_mode: str = "raw"
+    fragment_size: int = 0
+    fragment_hashes: int = 0
+    large_chunks: int = 0
 
     @property
     def duplicate_ratio(self) -> float:
@@ -61,6 +68,19 @@ class ProcessStats:
         if self.total_chunks == 0:
             return 0.0
         return self.fpga_hot_hits / self.total_chunks
+
+    @property
+    def avg_fragments_per_chunk(self) -> float:
+        if self.total_chunks == 0:
+            return 0.0
+        return self.fragment_hashes / self.total_chunks
+
+
+@dataclass(frozen=True)
+class LogicalHashResult:
+    digest: bytes
+    hot_hit: bool
+    fragment_count: int
 
 
 @dataclass(frozen=True)
@@ -85,6 +105,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     process.add_argument("--min-size", type=int, default=DEFAULT_MIN_CHUNK_SIZE)
     process.add_argument("--avg-size", type=int, default=DEFAULT_AVG_CHUNK_SIZE)
     process.add_argument("--max-size", type=int, default=DEFAULT_MAX_CHUNK_SIZE)
+    process.add_argument("--fragment-size", type=int, default=DEFAULT_FRAGMENT_SIZE)
+    process.add_argument("--digest-mode", choices=("raw", "hierarchical"), default="raw")
     process.add_argument("--start-seq", type=lambda value: int(value, 0), default=1)
     process.add_argument("--verify-local", action="store_true")
     process.add_argument("--load-hot-table", action="store_true")
@@ -111,6 +133,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     process_dir.add_argument("--min-size", type=int, default=DEFAULT_MIN_CHUNK_SIZE)
     process_dir.add_argument("--avg-size", type=int, default=DEFAULT_AVG_CHUNK_SIZE)
     process_dir.add_argument("--max-size", type=int, default=DEFAULT_MAX_CHUNK_SIZE)
+    process_dir.add_argument("--fragment-size", type=int, default=DEFAULT_FRAGMENT_SIZE)
+    process_dir.add_argument("--digest-mode", choices=("raw", "hierarchical"), default="raw")
     process_dir.add_argument("--start-seq", type=lambda value: int(value, 0), default=1)
     process_dir.add_argument("--verify-local", action="store_true")
     process_dir.add_argument("--load-hot-table", action="store_true")
@@ -156,6 +180,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
     restore.add_argument("--source-path", default=None)
     restore.add_argument("--output-file", required=True)
     restore.add_argument("--write-dir", default=DEFAULT_WRITE_DIR)
+
+    kv_process = subparsers.add_parser("process-kv-file", help="Process a binary KVCache dump as logical KV pages.")
+    kv_process.add_argument("input_file")
+    kv_process.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    kv_process.add_argument("--fpga-ip", default=DEFAULT_FPGA_IP)
+    kv_process.add_argument("--host-ip", default=DEFAULT_HOST_IP)
+    kv_process.add_argument("--port", type=int, default=DEFAULT_PORT)
+    kv_process.add_argument("--timeout", type=float, default=5.0)
+    kv_process.add_argument("--fragment-size", type=int, default=DEFAULT_FRAGMENT_SIZE)
+    kv_process.add_argument("--digest-mode", choices=("raw", "hierarchical"), default="hierarchical")
+    kv_process.add_argument("--start-seq", type=lambda value: int(value, 0), default=1)
+    kv_process.add_argument("--verify-local", action="store_true")
+    kv_process.add_argument("--request-id", required=True)
+    kv_process.add_argument("--model-id", default="unknown-model")
+    kv_process.add_argument("--layer-id", type=int, default=0)
+    kv_process.add_argument("--kv-kind", choices=("K", "V"), default="K")
+    kv_process.add_argument("--head-group", type=int, default=0)
+    kv_process.add_argument("--tokens-per-page", type=int, default=16)
+    kv_process.add_argument("--bytes-per-token", type=int, required=True)
+    kv_process.add_argument("--dtype", default="fp16")
+    kv_process.add_argument("--shape", default="")
+    kv_process.add_argument("--print-pages", action="store_true")
+    kv_process.add_argument("--write-dir", default=DEFAULT_WRITE_DIR)
+
+    kv_restore = subparsers.add_parser("restore-kv", help="Restore one processed KV run from unique block storage.")
+    kv_restore.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    kv_restore.add_argument("--run-id", type=int, default=None)
+    kv_restore.add_argument("--request-id", default=None)
+    kv_restore.add_argument("--output-file", required=True)
+    kv_restore.add_argument("--write-dir", default=DEFAULT_WRITE_DIR)
 
     return parser
 
@@ -208,6 +262,74 @@ def reload_hot_table(
     )
 
 
+def aggregate_fragment_digests(
+    chunk_length: int,
+    fragment_size: int,
+    fragment_digests: list[bytes],
+) -> bytes:
+    hasher = hashlib.sha256()
+    hasher.update(b"FDED_CHUNK_V1")
+    hasher.update(struct.pack(">QII", chunk_length, fragment_size, len(fragment_digests)))
+    for digest in fragment_digests:
+        hasher.update(digest)
+    return hasher.digest()
+
+
+def split_fragments(data: bytes, fragment_size: int) -> Iterable[bytes]:
+    if fragment_size <= 0:
+        raise ValueError("fragment_size must be > 0")
+    for offset in range(0, len(data), fragment_size):
+        yield data[offset : offset + fragment_size]
+
+
+def hash_logical_chunk(
+    args: argparse.Namespace,
+    client: FpgaUdpClient,
+    seq_id: int,
+    data: bytes,
+) -> tuple[LogicalHashResult, int, float, float]:
+    fpga_seconds = 0.0
+    verify_seconds = 0.0
+
+    if args.digest_mode == "raw" or len(data) <= args.fragment_size:
+        fpga_t0 = perf_counter()
+        reply = client.hash_chunk(seq_id, data)
+        fpga_seconds += perf_counter() - fpga_t0
+        if args.verify_local:
+            verify_t0 = perf_counter()
+            local_digest = client.expected_digest(data)
+            if reply.digest != local_digest:
+                raise ValueError("logical chunk digest mismatch between FPGA and local hashlib")
+            verify_seconds += perf_counter() - verify_t0
+        return LogicalHashResult(reply.digest, reply.hot_hit, 1), seq_id + 1, fpga_seconds, verify_seconds
+
+    fragment_digests: list[bytes] = []
+    next_seq_id = seq_id
+    for fragment in split_fragments(data, args.fragment_size):
+        fpga_t0 = perf_counter()
+        reply = client.hash_chunk(next_seq_id, fragment)
+        fpga_seconds += perf_counter() - fpga_t0
+        if args.verify_local:
+            verify_t0 = perf_counter()
+            local_digest = client.expected_digest(fragment)
+            if reply.digest != local_digest:
+                raise ValueError(
+                    f"fragment seq_id 0x{next_seq_id:08x} digest mismatch between FPGA and local hashlib"
+                )
+            verify_seconds += perf_counter() - verify_t0
+        fragment_digests.append(reply.digest)
+        next_seq_id += 1
+
+    verify_t0 = perf_counter()
+    digest = aggregate_fragment_digests(
+        chunk_length=len(data),
+        fragment_size=args.fragment_size,
+        fragment_digests=fragment_digests,
+    )
+    verify_seconds += perf_counter() - verify_t0
+    return LogicalHashResult(digest, False, len(fragment_digests)), next_seq_id, fpga_seconds, verify_seconds
+
+
 def process_one_file(
     args: argparse.Namespace,
     input_path: Path,
@@ -226,6 +348,8 @@ def process_one_file(
         fixed_size=args.fixed_size,
         total_bytes=len(data),
         read_seconds=read_t1 - read_t0,
+        digest_mode=args.digest_mode,
+        fragment_size=args.fragment_size,
     )
 
     start_total = perf_counter()
@@ -249,13 +373,15 @@ def process_one_file(
         host_ip=args.host_ip,
         port=args.port,
         timeout=args.timeout,
-        max_data_len=args.max_size,
+        max_data_len=args.fragment_size,
     ) as client:
         if load_hot_table and args.load_hot_table:
             stats.hot_table_loaded = reload_hot_table(args, db, client)
             stats.hot_table_refreshes += 1
 
         last_hot_refresh = perf_counter()
+
+        next_seq_id = args.start_seq
 
         for chunk in chunks:
             if (
@@ -267,36 +393,33 @@ def process_one_file(
                 stats.hot_table_refreshes += 1
                 last_hot_refresh = perf_counter()
 
-            seq_id = args.start_seq + chunk.index
-            fpga_t0 = perf_counter()
-            reply = client.hash_chunk(seq_id, chunk.data)
-            fpga_t1 = perf_counter()
-            stats.fpga_seconds += fpga_t1 - fpga_t0
-            if reply.hot_hit:
+            seq_id = next_seq_id
+            hash_result, next_seq_id, fpga_seconds, verify_seconds = hash_logical_chunk(
+                args=args,
+                client=client,
+                seq_id=seq_id,
+                data=chunk.data,
+            )
+            stats.fpga_seconds += fpga_seconds
+            stats.verify_seconds += verify_seconds
+            stats.fragment_hashes += hash_result.fragment_count
+            if hash_result.fragment_count > 1:
+                stats.large_chunks += 1
+            if hash_result.hot_hit:
                 stats.fpga_hot_hits += 1
 
-            if args.verify_local:
-                verify_t0 = perf_counter()
-                local_digest = client.expected_digest(chunk.data)
-                if reply.digest != local_digest:
-                    raise ValueError(
-                        f"chunk {chunk.index} digest mismatch between FPGA and local hashlib"
-                    )
-                verify_t1 = perf_counter()
-                stats.verify_seconds += verify_t1 - verify_t0
-
             db_t0 = perf_counter()
-            if reply.hot_hit:
+            if hash_result.hot_hit:
                 if args.verify_hot_hit:
                     stats.host_lookups += 1
-                    if not db.has_digest(reply.digest):
+                    if not db.has_digest(hash_result.digest):
                         raise ValueError(
                             f"chunk {chunk.index} FPGA HOT_HIT digest is absent from sqlite"
                         )
                 else:
                     stats.host_lookup_avoided += 1
                 record = db.record_trusted_duplicate(
-                    digest=reply.digest,
+                    digest=hash_result.digest,
                     chunk_length=chunk.length,
                     source_path=str(input_path),
                     chunk_index=chunk.index,
@@ -306,7 +429,7 @@ def process_one_file(
             else:
                 stats.host_lookups += 1
                 record = db.record_digest(
-                    digest=reply.digest,
+                    digest=hash_result.digest,
                     chunk_length=chunk.length,
                     source_path=str(input_path),
                     chunk_index=chunk.index,
@@ -321,18 +444,19 @@ def process_one_file(
             else:
                 stats.unique_chunks += 1
                 write_t0 = perf_counter()
-                written = write_unique_chunk(args.write_dir, reply.digest, chunk.data)
+                written = write_unique_chunk(args.write_dir, hash_result.digest, chunk.data)
                 write_t1 = perf_counter()
                 stats.write_seconds += write_t1 - write_t0
                 stats.written_unique_bytes += written
 
             if args.print_chunks:
                 status = "dup" if record.is_duplicate else "new"
-                hot_status = "hot" if reply.hot_hit else "miss"
+                hot_status = "hot" if hash_result.hot_hit else "miss"
                 print(
                     f"chunk={chunk.index:04d} offset={chunk.offset:08d} "
                     f"len={chunk.length:04d} seq=0x{seq_id:08x} {hot_status} {status} "
-                    f"ref_count={record.ref_count} digest={reply.digest.hex()}"
+                    f"frags={hash_result.fragment_count} ref_count={record.ref_count} "
+                    f"digest={hash_result.digest.hex()}"
                 )
 
     stats.elapsed_seconds = perf_counter() - start_total
@@ -354,6 +478,8 @@ def write_result_tables(
         handle.write(f"- `min_size`: `{args.min_size}`\n")
         handle.write(f"- `avg_size`: `{args.avg_size}`\n")
         handle.write(f"- `max_size`: `{args.max_size}`\n")
+        handle.write(f"- `digest_mode`: `{args.digest_mode}`\n")
+        handle.write(f"- `fragment_size`: `{args.fragment_size}`\n")
         handle.write(f"- `fpga_ip`: `{args.fpga_ip}`\n")
         handle.write(f"- `host_ip`: `{args.host_ip}`\n")
         handle.write(f"- `port`: `{args.port}`\n")
@@ -365,13 +491,15 @@ def write_result_tables(
         handle.write(f"- `verify_hot_hit`: `{args.verify_hot_hit}`\n")
         handle.write(f"- `write_dir`: `{args.write_dir}`\n\n")
         handle.write("## Results\n\n")
-        handle.write("| run_id | input_path | bytes | chunks | unique | duplicate | unique_write_bytes | duplicate_ratio | fpga_hot_hits | host_lookups | lookup_avoided | hot_hit_ratio | hot_loaded | hot_refreshes | elapsed_s | read_s | chunk_s | fpga_s | verify_s | db_s | write_s |\n")
-        handle.write("|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+        handle.write("| run_id | input_path | bytes | chunks | unique | duplicate | unique_write_bytes | duplicate_ratio | digest_mode | fragment_size | fragment_hashes | large_chunks | avg_fragments | fpga_hot_hits | host_lookups | lookup_avoided | hot_hit_ratio | hot_loaded | hot_refreshes | elapsed_s | read_s | chunk_s | fpga_s | verify_s | db_s | write_s |\n")
+        handle.write("|---:|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
         for stats in stats_list:
             handle.write(
                 f"| {stats.run_id} | {stats.input_path} | {stats.total_bytes} | {stats.total_chunks} | "
                 f"{stats.unique_chunks} | {stats.duplicate_chunks} | {stats.written_unique_bytes} | "
-                f"{stats.duplicate_ratio:.4f} | {stats.fpga_hot_hits} | "
+                f"{stats.duplicate_ratio:.4f} | {stats.digest_mode} | {stats.fragment_size} | "
+                f"{stats.fragment_hashes} | {stats.large_chunks} | {stats.avg_fragments_per_chunk:.4f} | "
+                f"{stats.fpga_hot_hits} | "
                 f"{stats.host_lookups} | {stats.host_lookup_avoided} | "
                 f"{stats.hot_hit_ratio:.4f} | {stats.hot_table_loaded} | "
                 f"{stats.hot_table_refreshes} | "
@@ -400,9 +528,10 @@ def render_result_table_image(
     title = "FDED_host Test Results"
     subtitle = (
         f"mode={args.chunk_mode} min={args.min_size} avg={args.avg_size} "
-        f"max={args.max_size} fpga={args.fpga_ip}:{args.port} write={args.write_dir}"
+        f"max={args.max_size} digest={args.digest_mode} frag={args.fragment_size} "
+        f"fpga={args.fpga_ip}:{args.port} write={args.write_dir}"
     )
-    headers = ["file", "bytes", "chunks", "unique", "dup", "write_B", "dup_ratio", "hot", "lookups", "saved", "hot_ratio", "loads", "elapsed_s", "fpga_s", "db_s", "write_s"]
+    headers = ["file", "bytes", "chunks", "unique", "dup", "write_B", "dup_ratio", "frags", "large", "avg_frag", "hot", "lookups", "saved", "hot_ratio", "loads", "elapsed_s", "fpga_s", "db_s", "write_s"]
     rows = []
     for stats in stats_list:
         rows.append(
@@ -414,6 +543,9 @@ def render_result_table_image(
                 str(stats.duplicate_chunks),
                 str(stats.written_unique_bytes),
                 f"{stats.duplicate_ratio:.4f}",
+                str(stats.fragment_hashes),
+                str(stats.large_chunks),
+                f"{stats.avg_fragments_per_chunk:.2f}",
                 str(stats.fpga_hot_hits),
                 str(stats.host_lookups),
                 str(stats.host_lookup_avoided),
@@ -491,6 +623,11 @@ def print_stats(stats: ProcessStats) -> None:
     print(f"duplicate     {stats.duplicate_chunks}")
     print(f"write_bytes   {stats.written_unique_bytes}")
     print(f"dup_ratio     {stats.duplicate_ratio:.4f}")
+    print(f"digest_mode   {stats.digest_mode}")
+    print(f"fragment_size {stats.fragment_size}")
+    print(f"fragments     {stats.fragment_hashes}")
+    print(f"large_chunks  {stats.large_chunks}")
+    print(f"avg_fragments {stats.avg_fragments_per_chunk:.4f}")
     print(f"fpga_hot_hits {stats.fpga_hot_hits}")
     print(f"host_lookups  {stats.host_lookups}")
     print(f"lookup_saved  {stats.host_lookup_avoided}")
@@ -686,6 +823,196 @@ def restore_file(args: argparse.Namespace) -> int:
     return 0
 
 
+def process_kv_file(args: argparse.Namespace) -> int:
+    input_path = Path(args.input_file).resolve()
+    data = input_path.read_bytes()
+    if args.tokens_per_page <= 0:
+        raise ValueError("tokens_per_page must be > 0")
+    if args.bytes_per_token <= 0:
+        raise ValueError("bytes_per_token must be > 0")
+
+    page_size = args.tokens_per_page * args.bytes_per_token
+    pages = list(fixed_size_chunks(data, page_size))
+    shape = args.shape or (
+        f"bytes={len(data)},tokens_per_page={args.tokens_per_page},"
+        f"bytes_per_token={args.bytes_per_token}"
+    )
+
+    db = FingerprintDb(args.db_path)
+    stats = ProcessStats(
+        input_path=str(input_path),
+        chunk_mode="kv-page",
+        fixed_size=page_size,
+        total_bytes=len(data),
+        digest_mode=args.digest_mode,
+        fragment_size=args.fragment_size,
+    )
+    try:
+        stats.run_id = db.create_kv_run(
+            source_path=str(input_path),
+            request_id=args.request_id,
+            model_id=args.model_id,
+            total_bytes=len(data),
+            page_count=len(pages),
+            tokens_per_page=args.tokens_per_page,
+            bytes_per_token=args.bytes_per_token,
+            dtype=args.dtype,
+            shape=shape,
+        )
+
+        with FpgaUdpClient(
+            fpga_ip=args.fpga_ip,
+            host_ip=args.host_ip,
+            port=args.port,
+            timeout=args.timeout,
+            max_data_len=args.fragment_size,
+        ) as client:
+            next_seq_id = args.start_seq
+            start_total = perf_counter()
+            for page in pages:
+                hash_result, next_seq_id, fpga_seconds, verify_seconds = hash_logical_chunk(
+                    args=args,
+                    client=client,
+                    seq_id=next_seq_id,
+                    data=page.data,
+                )
+                stats.fpga_seconds += fpga_seconds
+                stats.verify_seconds += verify_seconds
+                stats.fragment_hashes += hash_result.fragment_count
+                if hash_result.fragment_count > 1:
+                    stats.large_chunks += 1
+
+                db_t0 = perf_counter()
+                record = db.record_digest(
+                    digest=hash_result.digest,
+                    chunk_length=page.length,
+                    source_path=f"kv://{args.request_id}",
+                    chunk_index=page.index,
+                    chunk_offset=page.offset,
+                    run_id=None,
+                )
+                db.record_kv_page(
+                    run_id=stats.run_id,
+                    request_id=args.request_id,
+                    model_id=args.model_id,
+                    layer_id=args.layer_id,
+                    kv_kind=args.kv_kind,
+                    head_group=args.head_group,
+                    page_index=page.index,
+                    token_start=page.index * args.tokens_per_page,
+                    token_count=(page.length + args.bytes_per_token - 1) // args.bytes_per_token,
+                    dtype=args.dtype,
+                    shape=shape,
+                    page_length=page.length,
+                    digest=hash_result.digest,
+                    is_duplicate=record.is_duplicate,
+                )
+                stats.db_seconds += perf_counter() - db_t0
+
+                stats.total_chunks += 1
+                if record.is_duplicate:
+                    stats.duplicate_chunks += 1
+                else:
+                    stats.unique_chunks += 1
+                    write_t0 = perf_counter()
+                    stats.written_unique_bytes += write_unique_chunk(
+                        args.write_dir,
+                        hash_result.digest,
+                        page.data,
+                    )
+                    stats.write_seconds += perf_counter() - write_t0
+
+                if args.print_pages:
+                    status = "dup" if record.is_duplicate else "new"
+                    print(
+                        f"kv_page={page.index:04d} layer={args.layer_id} kind={args.kv_kind} "
+                        f"head_group={args.head_group} token_start={page.index * args.tokens_per_page} "
+                        f"tokens={((page.length + args.bytes_per_token - 1) // args.bytes_per_token)} "
+                        f"len={page.length} frags={hash_result.fragment_count} {status} "
+                        f"digest={hash_result.digest.hex()}"
+                    )
+
+            stats.elapsed_seconds = perf_counter() - start_total
+    finally:
+        db.close()
+
+    print("kv_run        " + str(stats.run_id))
+    print(f"request_id    {args.request_id}")
+    print(f"model_id      {args.model_id}")
+    print(f"layer_id      {args.layer_id}")
+    print(f"kv_kind       {args.kv_kind}")
+    print(f"head_group    {args.head_group}")
+    print(f"bytes         {stats.total_bytes}")
+    print(f"pages         {stats.total_chunks}")
+    print(f"unique        {stats.unique_chunks}")
+    print(f"duplicate     {stats.duplicate_chunks}")
+    print(f"write_bytes   {stats.written_unique_bytes}")
+    print(f"digest_mode   {stats.digest_mode}")
+    print(f"fragment_size {stats.fragment_size}")
+    print(f"fragments     {stats.fragment_hashes}")
+    print(f"large_pages   {stats.large_chunks}")
+    print(f"avg_fragments {stats.avg_fragments_per_chunk:.4f}")
+    print(f"elapsed_s     {stats.elapsed_seconds:.4f}")
+    print(f"fpga_s        {stats.fpga_seconds:.4f}")
+    print(f"db_s          {stats.db_seconds:.4f}")
+    print(f"write_s       {stats.write_seconds:.4f}")
+    return 0
+
+
+def restore_kv(args: argparse.Namespace) -> int:
+    if args.run_id is None and args.request_id is None:
+        raise SystemExit("restore-kv requires --run-id or --request-id")
+    if args.run_id is not None and args.request_id is not None:
+        raise SystemExit("use only one of --run-id or --request-id")
+
+    db = FingerprintDb(args.db_path)
+    try:
+        if args.run_id is not None:
+            kv_run = db.get_kv_run(args.run_id)
+        else:
+            kv_run = db.get_latest_kv_run(args.request_id)
+        pages = db.get_kv_pages(kv_run.id)
+    finally:
+        db.close()
+
+    if len(pages) != kv_run.page_count:
+        raise ValueError(
+            f"KV run {kv_run.id} expected {kv_run.page_count} page(s), got {len(pages)}"
+        )
+
+    chunk_dir = Path(args.write_dir).resolve() / "chunks"
+    output_path = Path(args.output_file).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    restored_bytes = 0
+    with output_path.open("wb") as output:
+        for page in pages:
+            chunk_path = chunk_dir / f"{page.digest.hex()}.bin"
+            if not chunk_path.exists():
+                raise FileNotFoundError(f"missing KV block file: {chunk_path}")
+            block = chunk_path.read_bytes()
+            if len(block) != page.page_length:
+                raise ValueError(
+                    f"KV page {page.page_index} length mismatch: "
+                    f"metadata={page.page_length}, file={len(block)}"
+                )
+            output.write(block)
+            restored_bytes += len(block)
+
+    if restored_bytes != kv_run.total_bytes:
+        raise ValueError(
+            f"restored KV byte count mismatch: metadata={kv_run.total_bytes}, restored={restored_bytes}"
+        )
+
+    print(f"restored_kv_run {kv_run.id}")
+    print(f"request_id      {kv_run.request_id}")
+    print(f"model_id        {kv_run.model_id}")
+    print(f"source_file     {kv_run.source_path}")
+    print(f"output_file     {output_path}")
+    print(f"bytes           {restored_bytes}")
+    print(f"pages           {len(pages)}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -704,5 +1031,9 @@ def main(argv: list[str] | None = None) -> int:
         return list_runs(args)
     if args.command == "restore-file":
         return restore_file(args)
+    if args.command == "process-kv-file":
+        return process_kv_file(args)
+    if args.command == "restore-kv":
+        return restore_kv(args)
     parser.error(f"unsupported command: {args.command}")
     return 2

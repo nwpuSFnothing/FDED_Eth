@@ -29,6 +29,28 @@ class ChunkEvent:
     digest: bytes
 
 
+@dataclass(frozen=True)
+class KvRun:
+    id: int
+    source_path: str
+    request_id: str
+    model_id: str
+    total_bytes: int
+    page_count: int
+    tokens_per_page: int
+    bytes_per_token: int
+    created_at: str
+
+
+@dataclass(frozen=True)
+class KvPage:
+    page_index: int
+    token_start: int
+    token_count: int
+    page_length: int
+    digest: bytes
+
+
 class FingerprintDb:
     def __init__(self, db_path: str) -> None:
         self.db_path = Path(db_path)
@@ -88,6 +110,47 @@ class FingerprintDb:
             )
             """
         )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kv_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                total_bytes INTEGER NOT NULL,
+                page_count INTEGER NOT NULL,
+                tokens_per_page INTEGER NOT NULL,
+                bytes_per_token INTEGER NOT NULL,
+                dtype TEXT NOT NULL,
+                shape TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kv_pages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                request_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                layer_id INTEGER NOT NULL,
+                kv_kind TEXT NOT NULL,
+                head_group INTEGER NOT NULL,
+                page_index INTEGER NOT NULL,
+                token_start INTEGER NOT NULL,
+                token_count INTEGER NOT NULL,
+                dtype TEXT NOT NULL,
+                shape TEXT NOT NULL,
+                page_length INTEGER NOT NULL,
+                digest BLOB NOT NULL,
+                is_duplicate INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(run_id) REFERENCES kv_runs(id),
+                FOREIGN KEY(digest) REFERENCES fingerprints(digest)
+            )
+            """
+        )
         columns = {
             str(row[1])
             for row in self.conn.execute("PRAGMA table_info(chunk_events)").fetchall()
@@ -104,6 +167,18 @@ class FingerprintDb:
             """
             CREATE INDEX IF NOT EXISTS idx_file_runs_source_created
             ON file_runs(source_path, created_at)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_kv_pages_run_order
+            ON kv_pages(run_id, page_index)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_kv_runs_request_created
+            ON kv_runs(request_id, created_at)
             """
         )
         self.conn.commit()
@@ -326,6 +401,155 @@ class FingerprintDb:
                 chunk_offset=int(row[1]),
                 chunk_length=int(row[2]),
                 digest=bytes(row[3]),
+            )
+            for row in rows
+        ]
+
+    def create_kv_run(
+        self,
+        source_path: str,
+        request_id: str,
+        model_id: str,
+        total_bytes: int,
+        page_count: int,
+        tokens_per_page: int,
+        bytes_per_token: int,
+        dtype: str,
+        shape: str,
+    ) -> int:
+        cursor = self.conn.execute(
+            """
+            INSERT INTO kv_runs (
+                source_path, request_id, model_id, total_bytes, page_count,
+                tokens_per_page, bytes_per_token, dtype, shape
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source_path,
+                request_id,
+                model_id,
+                total_bytes,
+                page_count,
+                tokens_per_page,
+                bytes_per_token,
+                dtype,
+                shape,
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def record_kv_page(
+        self,
+        run_id: int,
+        request_id: str,
+        model_id: str,
+        layer_id: int,
+        kv_kind: str,
+        head_group: int,
+        page_index: int,
+        token_start: int,
+        token_count: int,
+        dtype: str,
+        shape: str,
+        page_length: int,
+        digest: bytes,
+        is_duplicate: bool,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO kv_pages (
+                run_id, request_id, model_id, layer_id, kv_kind, head_group,
+                page_index, token_start, token_count, dtype, shape,
+                page_length, digest, is_duplicate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                request_id,
+                model_id,
+                layer_id,
+                kv_kind,
+                head_group,
+                page_index,
+                token_start,
+                token_count,
+                dtype,
+                shape,
+                page_length,
+                digest,
+                int(is_duplicate),
+            ),
+        )
+        self.conn.commit()
+
+    def get_kv_run(self, run_id: int) -> KvRun:
+        row = self.conn.execute(
+            """
+            SELECT id, source_path, request_id, model_id, total_bytes, page_count,
+                   tokens_per_page, bytes_per_token, created_at
+            FROM kv_runs
+            WHERE id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"no KV run with id {run_id}")
+        return KvRun(
+            id=int(row[0]),
+            source_path=str(row[1]),
+            request_id=str(row[2]),
+            model_id=str(row[3]),
+            total_bytes=int(row[4]),
+            page_count=int(row[5]),
+            tokens_per_page=int(row[6]),
+            bytes_per_token=int(row[7]),
+            created_at=str(row[8]),
+        )
+
+    def get_latest_kv_run(self, request_id: str) -> KvRun:
+        row = self.conn.execute(
+            """
+            SELECT id, source_path, request_id, model_id, total_bytes, page_count,
+                   tokens_per_page, bytes_per_token, created_at
+            FROM kv_runs
+            WHERE request_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (request_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"no KV run for request_id {request_id}")
+        return KvRun(
+            id=int(row[0]),
+            source_path=str(row[1]),
+            request_id=str(row[2]),
+            model_id=str(row[3]),
+            total_bytes=int(row[4]),
+            page_count=int(row[5]),
+            tokens_per_page=int(row[6]),
+            bytes_per_token=int(row[7]),
+            created_at=str(row[8]),
+        )
+
+    def get_kv_pages(self, run_id: int) -> list[KvPage]:
+        rows = self.conn.execute(
+            """
+            SELECT page_index, token_start, token_count, page_length, digest
+            FROM kv_pages
+            WHERE run_id = ?
+            ORDER BY page_index ASC
+            """,
+            (run_id,),
+        ).fetchall()
+        return [
+            KvPage(
+                page_index=int(row[0]),
+                token_start=int(row[1]),
+                token_count=int(row[2]),
+                page_length=int(row[3]),
+                digest=bytes(row[4]),
             )
             for row in rows
         ]

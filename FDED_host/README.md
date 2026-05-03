@@ -39,6 +39,38 @@ Current default `max-size` is `1468`, matching the verified stable FPGA UDP payl
 
 The current `cdc` mode uses the `fastcdc` Python package directly.
 
+## Hierarchical Digest Mode
+
+The FPGA UDP path still hashes one payload per request. To test logical chunks larger than the stable UDP payload limit without changing the FPGA, use Host-side fragment aggregation:
+
+```bash
+python main.py process-file sample.bin --chunk-mode fixed --fixed-size 8192 --digest-mode hierarchical --fragment-size 1468
+```
+
+In `hierarchical` mode, chunks larger than `--fragment-size` are split on the Host. Each fragment is hashed by the FPGA, then the Host computes the logical chunk fingerprint as:
+
+```text
+SHA256("FDED_CHUNK_V1" + chunk_length + fragment_size + fragment_count + fragment_digest...)
+```
+
+Chunks that fit in one fragment keep the existing raw FPGA SHA-256 digest. This mode is intended for KVCache/page-level experiments where the logical page size should not be limited by Ethernet MTU.
+
+## KVCache Offline Simulation
+
+Process a binary KVCache dump as structure-aware logical KV pages:
+
+```bash
+python main.py process-kv-file kv_dump.bin --request-id req001 --model-id llama-demo --layer-id 0 --kv-kind K --head-group 0 --tokens-per-page 16 --bytes-per-token 4096 --digest-mode hierarchical --fragment-size 1468 --verify-local --print-pages
+```
+
+Restore the logical KV page sequence from unique block storage:
+
+```bash
+python main.py restore-kv --request-id req001 --output-file restored_kv_dump.bin
+```
+
+This first offline mode has no NumPy dependency. It treats the input as a binary KV tensor dump and records page metadata in `kv_runs` and `kv_pages`, including request/model/layer/KV kind/head group/token range/digest. Later `.npz` or runtime integrations can reuse the same mapping tables.
+
 ## Hot Table Flow
 
 Load the current sqlite top-N fingerprints into the FPGA hot digest table:
