@@ -53,6 +53,7 @@ reg   [15:0]         reply_payload_len_rx ;
 reg   [31:0]         result_seq_id_rx ;
 reg   [255:0]        result_digest_rx ;
 reg                  result_hot_hit_rx ;
+reg                  result_stream_ack_rx ;
 reg                  result_error_rx ;
 reg                  result_toggle_rx ;
 reg                  result_busy_rx ;
@@ -67,6 +68,7 @@ wire [10:0]          sha_ram_read_addr ;
 wire [31:0]          sha_seq_id ;
 wire [255:0]         sha_digest ;
 wire                 sha_hot_hit ;
+wire                 sha_stream_ack ;
 wire                 sha_done ;
 wire                 sha_error ;
 wire                 sha_busy ;
@@ -192,6 +194,7 @@ always@(posedge gmii_rx_clk or negedge rst_n)
         result_seq_id_rx         <= 32'd0 ;
         result_digest_rx         <= 256'd0 ;
         result_hot_hit_rx        <= 1'b0 ;
+        result_stream_ack_rx     <= 1'b0 ;
         result_error_rx          <= 1'b0 ;
         result_toggle_rx         <= 1'b0 ;
         result_busy_rx           <= 1'b0 ;
@@ -219,6 +222,7 @@ always@(posedge gmii_rx_clk or negedge rst_n)
             result_seq_id_rx <= sha_seq_id ;
             result_digest_rx <= sha_digest ;
             result_hot_hit_rx <= sha_hot_hit ;
+            result_stream_ack_rx <= sha_stream_ack ;
             result_error_rx  <= sha_error ;
             result_toggle_rx <= ~result_toggle_rx ;
             result_busy_rx   <= 1'b1 ;
@@ -253,7 +257,8 @@ always@(posedge gmii_tx_clk or negedge rst_n)
             hash_digest_buf_tx   <= result_digest_rx ;
             hash_error_buf_tx    <= result_error_rx ;
             hash_status_buf_tx   <= result_error_rx ? 8'h80 :
-                                    (result_hot_hit_rx ? 8'h01 : 8'h00) ;
+                                    (result_stream_ack_rx ? 8'h02 :
+                                    (result_hot_hit_rx ? 8'h01 : 8'h00)) ;
             reply_pending        <= 1'b1 ;
             result_ack_toggle_tx <= ~result_ack_toggle_tx ;
           end
@@ -370,6 +375,7 @@ udp_sha256_oneblock sha256_oneblock_inst
  .seq_id         (sha_seq_id          ),
  .digest         (sha_digest          ),
  .hot_hit        (sha_hot_hit         ),
+ .stream_ack     (sha_stream_ack      ),
  .done           (sha_done            ),
  .error          (sha_error           ),
  .busy           (sha_busy            )

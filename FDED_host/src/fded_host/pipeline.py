@@ -106,7 +106,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     process.add_argument("--avg-size", type=int, default=DEFAULT_AVG_CHUNK_SIZE)
     process.add_argument("--max-size", type=int, default=DEFAULT_MAX_CHUNK_SIZE)
     process.add_argument("--fragment-size", type=int, default=DEFAULT_FRAGMENT_SIZE)
-    process.add_argument("--digest-mode", choices=("raw", "hierarchical"), default="raw")
+    process.add_argument("--digest-mode", choices=("raw", "hierarchical", "fpga-stream"), default="raw")
     process.add_argument("--start-seq", type=lambda value: int(value, 0), default=1)
     process.add_argument("--verify-local", action="store_true")
     process.add_argument("--load-hot-table", action="store_true")
@@ -134,7 +134,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     process_dir.add_argument("--avg-size", type=int, default=DEFAULT_AVG_CHUNK_SIZE)
     process_dir.add_argument("--max-size", type=int, default=DEFAULT_MAX_CHUNK_SIZE)
     process_dir.add_argument("--fragment-size", type=int, default=DEFAULT_FRAGMENT_SIZE)
-    process_dir.add_argument("--digest-mode", choices=("raw", "hierarchical"), default="raw")
+    process_dir.add_argument("--digest-mode", choices=("raw", "hierarchical", "fpga-stream"), default="raw")
     process_dir.add_argument("--start-seq", type=lambda value: int(value, 0), default=1)
     process_dir.add_argument("--verify-local", action="store_true")
     process_dir.add_argument("--load-hot-table", action="store_true")
@@ -189,7 +189,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     kv_process.add_argument("--port", type=int, default=DEFAULT_PORT)
     kv_process.add_argument("--timeout", type=float, default=5.0)
     kv_process.add_argument("--fragment-size", type=int, default=DEFAULT_FRAGMENT_SIZE)
-    kv_process.add_argument("--digest-mode", choices=("raw", "hierarchical"), default="hierarchical")
+    kv_process.add_argument("--digest-mode", choices=("raw", "hierarchical", "fpga-stream"), default="hierarchical")
     kv_process.add_argument("--start-seq", type=lambda value: int(value, 0), default=1)
     kv_process.add_argument("--verify-local", action="store_true")
     kv_process.add_argument("--request-id", required=True)
@@ -290,6 +290,20 @@ def hash_logical_chunk(
 ) -> tuple[LogicalHashResult, int, float, float]:
     fpga_seconds = 0.0
     verify_seconds = 0.0
+
+    if args.digest_mode == "fpga-stream":
+        fpga_t0 = perf_counter()
+        reply = client.hash_stream(seq_id, data, args.fragment_size)
+        fpga_seconds += perf_counter() - fpga_t0
+        if args.verify_local:
+            verify_t0 = perf_counter()
+            local_digest = client.expected_digest(data)
+            if reply.digest != local_digest:
+                raise ValueError("FPGA stream digest mismatch between FPGA and local hashlib")
+            verify_seconds += perf_counter() - verify_t0
+        data_per_packet = max(1, args.fragment_size - 9)
+        fragment_count = max(1, (len(data) + data_per_packet - 1) // data_per_packet)
+        return LogicalHashResult(reply.digest, reply.hot_hit, fragment_count), seq_id + 1, fpga_seconds, verify_seconds
 
     if args.digest_mode == "raw" or len(data) <= args.fragment_size:
         fpga_t0 = perf_counter()

@@ -55,6 +55,22 @@ SHA256("FDED_CHUNK_V1" + chunk_length + fragment_size + fragment_count + fragmen
 
 Chunks that fit in one fragment keep the existing raw FPGA SHA-256 digest. This mode is intended for KVCache/page-level experiments where the logical page size should not be limited by Ethernet MTU.
 
+## FPGA Stream Digest Mode
+
+After rebuilding and downloading a bitstream that includes the stream protocol, use `fpga-stream` to make the FPGA compute the standard SHA-256 digest over the full logical chunk across multiple UDP packets:
+
+```bash
+python main.py process-file sample.bin --chunk-mode fixed --fixed-size 16384 --digest-mode fpga-stream --fragment-size 1468 --verify-local --print-chunks
+```
+
+In this mode, the Host sends `"FDED"` stream control packets:
+
+```text
+"FDED"[4B] + op[1B] + stream_id[4B] + total_len[4B] + data
+```
+
+The FPGA keeps SHA-256 state across `STREAM_START`, `STREAM_DATA`, and `STREAM_END`. The final digest returned by `STREAM_END` is expected to match `hashlib.sha256(full_chunk)`.
+
 ## KVCache Offline Simulation
 
 Process a binary KVCache dump as structure-aware logical KV pages:
