@@ -52,6 +52,7 @@ FDED_host/Result/
 
 # Keep root-level project reference docs
 !工程使用与测试指令参考.md
+!项目进展汇报.md
 
 # Ignore generated Vivado outputs inside the kept project
 FDED_Eth/FDED_Eth.cache/

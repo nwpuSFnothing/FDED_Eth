@@ -26,6 +26,7 @@ from .config import (
 )
 from .fingerprint_db import FingerprintDb
 from .fpga_client import FpgaUdpClient
+from .kv_block_manager import KvBlockManager, ManagedKvBlock
 
 
 @dataclass
@@ -96,28 +97,6 @@ class KvTraceAccess:
     step: int
     page_index: int
     request_id: str | None = None
-
-
-@dataclass
-class KvRuntimeSimStats:
-    accesses: int = 0
-    cache_hits: int = 0
-    cold_restores: int = 0
-    evictions: int = 0
-    fpga_hot_hits: int = 0
-    hot_table_refreshes: int = 0
-
-    @property
-    def cache_hit_ratio(self) -> float:
-        if self.accesses == 0:
-            return 0.0
-        return self.cache_hits / self.accesses
-
-    @property
-    def fpga_hot_hit_ratio(self) -> float:
-        if self.accesses == 0:
-            return 0.0
-        return self.fpga_hot_hits / self.accesses
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -251,6 +230,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     kv_sim.add_argument("--request-id", default=None)
     kv_sim.add_argument("--trace-file", default=None)
     kv_sim.add_argument("--repeat", type=int, default=1)
+    kv_sim.add_argument("--gpu-pages", type=int, default=16)
+    kv_sim.add_argument("--gpu-backend", choices=("simulate", "torch-cuda"), default="simulate")
+    kv_sim.add_argument("--gpu-page-bytes", type=int, default=4096)
+    kv_sim.add_argument("--cuda-device", default="cuda:0")
     kv_sim.add_argument("--cache-pages", type=int, default=64)
     kv_sim.add_argument("--fpga-hot-limit", type=int, default=512)
     kv_sim.add_argument("--hot-refresh-interval", type=int, default=32)
@@ -1123,16 +1106,9 @@ def load_kv_trace(trace_file: str | None, pages: list, repeat: int) -> list[KvTr
     return accesses
 
 
-def kv_hot_score(policy: str, access_count: int, ref_count: int, last_access_step: int, current_step: int) -> float:
-    age = max(0, current_step - last_access_step)
-    if policy == "lru":
-        return float(last_access_step)
-    if policy == "lfu":
-        return float(access_count)
-    return access_count * 4.0 + ref_count * 1.5 + last_access_step * 0.05 - age * 0.02
-
-
 def simulate_kv_runtime(args: argparse.Namespace) -> int:
+    if args.gpu_pages <= 0:
+        raise ValueError("gpu-pages must be > 0")
     if args.cache_pages <= 0:
         raise ValueError("cache-pages must be > 0")
     if args.hot_refresh_interval <= 0:
@@ -1169,104 +1145,74 @@ def simulate_kv_runtime(args: argparse.Namespace) -> int:
             block_by_page[page.page_index] = block
 
         accesses = load_kv_trace(args.trace_file, pages, args.repeat)
-        cache: dict[int, dict[str, object]] = {}
-        block_stats: dict[int, dict[str, object]] = {}
-        for block in block_by_page.values():
-            block_stats[block.id] = {
-                "digest": block.digest,
-                "ref_count": block.ref_count,
-                "access_count": 0,
-                "last_access_step": 0,
-                "hot_score": block.hot_score,
-            }
-
-        stats = KvRuntimeSimStats()
-        fpga_hot_digests: set[bytes] = set()
+        unique_blocks = {
+            block.id: ManagedKvBlock(
+                id=block.id,
+                digest=block.digest,
+                ref_count=block.ref_count,
+                hot_score=block.hot_score,
+            )
+            for block in block_by_page.values()
+        }
+        manager = KvBlockManager(
+            blocks=list(unique_blocks.values()),
+            gpu_pages=args.gpu_pages,
+            host_cache_pages=args.cache_pages,
+            fpga_hot_limit=args.fpga_hot_limit,
+            hot_refresh_interval=args.hot_refresh_interval,
+            policy=args.policy,
+            gpu_backend=args.gpu_backend,
+            gpu_page_bytes=args.gpu_page_bytes,
+            cuda_device=args.cuda_device,
+        )
 
         for access in accesses:
             if access.page_index not in page_by_index:
                 raise KeyError(f"trace references missing page_index {access.page_index}")
             block = block_by_page[access.page_index]
-
-            if stats.accesses % args.hot_refresh_interval == 0:
-                ranked = sorted(
-                    block_stats.values(),
-                    key=lambda item: (float(item["hot_score"]), int(item["ref_count"])),
-                    reverse=True,
-                )
-                fpga_hot_digests = {
-                    bytes(item["digest"]) for item in ranked[: args.fpga_hot_limit]
-                }
-                stats.hot_table_refreshes += 1
-
-            cache_hit = block.id in cache
-            fpga_hot_hit = block.digest in fpga_hot_digests
-            if cache_hit:
-                stats.cache_hits += 1
-            else:
-                stats.cold_restores += 1
-                if len(cache) >= args.cache_pages:
-                    victim_id, _victim = min(
-                        cache.items(),
-                        key=lambda item: float(item[1]["hot_score"]),
-                    )
-                    del cache[victim_id]
-                    stats.evictions += 1
-
-            if fpga_hot_hit:
-                stats.fpga_hot_hits += 1
-
-            item = block_stats[block.id]
-            access_count = int(item["access_count"]) + 1
-            score = kv_hot_score(
-                args.policy,
-                access_count=access_count,
-                ref_count=int(item["ref_count"]),
-                last_access_step=int(item["last_access_step"]),
-                current_step=access.step,
-            )
-            item["access_count"] = access_count
-            item["last_access_step"] = access.step
-            item["hot_score"] = score
-            cache[block.id] = {
-                "digest": block.digest,
-                "access_count": access_count,
-                "last_access_step": access.step,
-                "hot_score": score,
-            }
+            result = manager.access(unique_blocks[block.id], access.step)
             db.record_kv_access(
                 step=access.step,
                 request_id=access.request_id or kv_run.request_id,
                 run_id=kv_run.id,
                 page_index=access.page_index,
                 unique_block_id=block.id,
-                cache_hit=cache_hit,
-                fpga_hot_hit=fpga_hot_hit,
+                cache_hit=result.gpu_hit,
+                fpga_hot_hit=result.fpga_hot_hit,
                 policy=args.policy,
-                hot_score=score,
+                hot_score=result.hot_score,
             )
-            stats.accesses += 1
 
             if args.print_accesses:
-                location = "HOST_CACHE" if cache_hit else "COLD_FILE"
                 print(
                     f"step={access.step:06d} page={access.page_index:04d} "
-                    f"unique_block={block.id} {location} "
-                    f"fpga_hot={'hit' if fpga_hot_hit else 'miss'} score={score:.3f}"
+                    f"unique_block={block.id} {result.source} "
+                    f"fpga_hot={'hit' if result.fpga_hot_hit else 'miss'} "
+                    f"score={result.hot_score:.3f}"
                 )
     finally:
         db.close()
 
+    stats = manager.stats
     print(f"kv_run              {kv_run.id}")
     print(f"request_id          {kv_run.request_id}")
     print(f"policy              {args.policy}")
+    print(f"gpu_backend         {args.gpu_backend}")
+    print(f"gpu_pages           {args.gpu_pages}")
+    print(f"gpu_page_bytes      {args.gpu_page_bytes}")
     print(f"cache_pages         {args.cache_pages}")
     print(f"fpga_hot_limit      {args.fpga_hot_limit}")
     print(f"accesses            {stats.accesses}")
-    print(f"cache_hits          {stats.cache_hits}")
+    print(f"gpu_hits            {stats.gpu_hits}")
+    print(f"host_cache_hits     {stats.host_cache_hits}")
     print(f"cold_restores       {stats.cold_restores}")
-    print(f"evictions           {stats.evictions}")
-    print(f"cache_hit_ratio     {stats.cache_hit_ratio:.4f}")
+    print(f"gpu_promotions      {stats.gpu_promotions}")
+    print(f"gpu_evictions       {stats.gpu_evictions}")
+    print(f"host_evictions      {stats.host_evictions}")
+    print(f"gpu_allocated_bytes {stats.gpu_allocated_bytes}")
+    print(f"gpu_reserved_bytes  {stats.gpu_reserved_bytes}")
+    print(f"gpu_hit_ratio       {stats.gpu_hit_ratio:.4f}")
+    print(f"host_hit_ratio      {stats.host_cache_hit_ratio:.4f}")
     print(f"fpga_hot_hits       {stats.fpga_hot_hits}")
     print(f"fpga_hot_hit_ratio  {stats.fpga_hot_hit_ratio:.4f}")
     print(f"hot_refreshes       {stats.hot_table_refreshes}")

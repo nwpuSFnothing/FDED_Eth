@@ -20,6 +20,7 @@ pip install fastcdc
 - `src/fded_host/chunker.py`: fixed-size and FastCDC chunkers
 - `src/fded_host/fpga_client.py`: UDP client for the FPGA SHA-256 service
 - `src/fded_host/fingerprint_db.py`: sqlite3 fingerprint index
+- `src/fded_host/kv_block_manager.py`: pure-Python KV block manager model for GPU/Host/Cold placement
 - `src/fded_host/pipeline.py`: file processing pipeline
 - `data/fingerprints.db`: default sqlite database
 
@@ -89,16 +90,16 @@ This first offline mode has no NumPy dependency. It treats the input as a binary
 
 ## KVCache Runtime Simulation
 
-The current prototype does not use GPU memory directly. It models the online indirection layer on the Host:
+The current prototype does not use CUDA or a real LLM runtime directly. It models the online indirection layer with a simulated GPU KV page pool:
 
 ```text
-logical KV page -> unique KV block -> HOST_CACHE or COLD_FILE
+logical KV page -> unique KV block -> GPU_PAGE, HOST_CACHE, or COLD_FILE
 ```
 
 After `process-kv-file`, run a trace-driven cache and hot-table simulation:
 
 ```bash
-python main.py simulate-kv-runtime --request-id req001 --cache-pages 64 --fpga-hot-limit 512 --policy inference-hot
+python main.py simulate-kv-runtime --request-id req001 --gpu-pages 16 --cache-pages 64 --fpga-hot-limit 512 --policy inference-hot
 ```
 
 Without `--trace-file`, the simulator scans the recorded logical KV pages in order. Use `--repeat N` to replay the page sequence multiple times. A CSV trace can provide at least:
@@ -110,14 +111,22 @@ step,page_index
 2,0
 ```
 
-The simulator records `kv_access_events` and updates `unique_kv_blocks.hot_score`. It reports:
+The simulator records `kv_access_events` and updates `unique_kv_blocks.hot_score`. Each logical access must end in `GPU_PAGE`; misses are promoted from `HOST_CACHE` or restored from `COLD_FILE`. It reports:
 
-- `cache_hit_ratio`: simulated Host cache hits for unique KV blocks
+- `gpu_hit_ratio`: simulated GPU KV page pool hits
+- `host_hit_ratio`: simulated Host cache hits before GPU promotion
 - `cold_restores`: logical page accesses restored from cold unique-block storage
 - `fpga_hot_hit_ratio`: simulated hit ratio against the top scored digest set
-- `evictions`: unique blocks removed from the simulated Host cache
+- `gpu_evictions`: unique blocks removed from the simulated GPU page pool
+- `host_evictions`: unique blocks removed from the simulated Host cache
 
-This is the CPU-FPGA prototype path for validating logical redirection and inference-aware hot scheduling before integrating with a GPU KV page pool.
+By default, `GPU_PAGE` is simulated. To allocate real CUDA memory with PyTorch:
+
+```bash
+python main.py simulate-kv-runtime --request-id req001 --gpu-backend torch-cuda --gpu-pages 16 --gpu-page-bytes 65536 --cache-pages 64 --fpga-hot-limit 512
+```
+
+`--gpu-page-bytes` controls the number of CUDA bytes allocated per promoted KV block. This is still not a real LLM runtime integration, but the GPU page pool now uses actual CUDA tensors when `--gpu-backend torch-cuda` is selected.
 
 ## Hot Table Flow
 
