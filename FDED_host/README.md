@@ -87,6 +87,38 @@ python main.py restore-kv --request-id req001 --output-file restored_kv_dump.bin
 
 This first offline mode has no NumPy dependency. It treats the input as a binary KV tensor dump and records page metadata in `kv_runs` and `kv_pages`, including request/model/layer/KV kind/head group/token range/digest. Later `.npz` or runtime integrations can reuse the same mapping tables.
 
+## KVCache Runtime Simulation
+
+The current prototype does not use GPU memory directly. It models the online indirection layer on the Host:
+
+```text
+logical KV page -> unique KV block -> HOST_CACHE or COLD_FILE
+```
+
+After `process-kv-file`, run a trace-driven cache and hot-table simulation:
+
+```bash
+python main.py simulate-kv-runtime --request-id req001 --cache-pages 64 --fpga-hot-limit 512 --policy inference-hot
+```
+
+Without `--trace-file`, the simulator scans the recorded logical KV pages in order. Use `--repeat N` to replay the page sequence multiple times. A CSV trace can provide at least:
+
+```text
+step,page_index
+0,0
+1,1
+2,0
+```
+
+The simulator records `kv_access_events` and updates `unique_kv_blocks.hot_score`. It reports:
+
+- `cache_hit_ratio`: simulated Host cache hits for unique KV blocks
+- `cold_restores`: logical page accesses restored from cold unique-block storage
+- `fpga_hot_hit_ratio`: simulated hit ratio against the top scored digest set
+- `evictions`: unique blocks removed from the simulated Host cache
+
+This is the CPU-FPGA prototype path for validating logical redirection and inference-aware hot scheduling before integrating with a GPU KV page pool.
+
 ## Hot Table Flow
 
 Load the current sqlite top-N fingerprints into the FPGA hot digest table:

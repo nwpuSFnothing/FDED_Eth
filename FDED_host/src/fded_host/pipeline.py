@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
+import json
 import struct
 from dataclasses import dataclass
 from datetime import datetime
@@ -87,6 +89,35 @@ class LogicalHashResult:
 class ResultPaths:
     png_path: Path
     md_path: Path
+
+
+@dataclass(frozen=True)
+class KvTraceAccess:
+    step: int
+    page_index: int
+    request_id: str | None = None
+
+
+@dataclass
+class KvRuntimeSimStats:
+    accesses: int = 0
+    cache_hits: int = 0
+    cold_restores: int = 0
+    evictions: int = 0
+    fpga_hot_hits: int = 0
+    hot_table_refreshes: int = 0
+
+    @property
+    def cache_hit_ratio(self) -> float:
+        if self.accesses == 0:
+            return 0.0
+        return self.cache_hits / self.accesses
+
+    @property
+    def fpga_hot_hit_ratio(self) -> float:
+        if self.accesses == 0:
+            return 0.0
+        return self.fpga_hot_hits / self.accesses
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -210,6 +241,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     kv_restore.add_argument("--request-id", default=None)
     kv_restore.add_argument("--output-file", required=True)
     kv_restore.add_argument("--write-dir", default=DEFAULT_WRITE_DIR)
+
+    kv_sim = subparsers.add_parser(
+        "simulate-kv-runtime",
+        help="Trace-driven Host cache and FPGA hot-table simulation for logical KV pages.",
+    )
+    kv_sim.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    kv_sim.add_argument("--run-id", type=int, default=None)
+    kv_sim.add_argument("--request-id", default=None)
+    kv_sim.add_argument("--trace-file", default=None)
+    kv_sim.add_argument("--repeat", type=int, default=1)
+    kv_sim.add_argument("--cache-pages", type=int, default=64)
+    kv_sim.add_argument("--fpga-hot-limit", type=int, default=512)
+    kv_sim.add_argument("--hot-refresh-interval", type=int, default=32)
+    kv_sim.add_argument("--policy", choices=("lru", "lfu", "inference-hot"), default="inference-hot")
+    kv_sim.add_argument("--print-accesses", action="store_true")
 
     return parser
 
@@ -905,6 +951,12 @@ def process_kv_file(args: argparse.Namespace) -> int:
                     chunk_offset=page.offset,
                     run_id=None,
                 )
+                unique_block = db.record_unique_kv_block(
+                    digest=hash_result.digest,
+                    block_length=page.length,
+                    dtype=args.dtype,
+                    shape=shape,
+                )
                 db.record_kv_page(
                     run_id=stats.run_id,
                     request_id=args.request_id,
@@ -920,6 +972,7 @@ def process_kv_file(args: argparse.Namespace) -> int:
                     page_length=page.length,
                     digest=hash_result.digest,
                     is_duplicate=record.is_duplicate,
+                    unique_block_id=unique_block.id,
                 )
                 stats.db_seconds += perf_counter() - db_t0
 
@@ -943,7 +996,7 @@ def process_kv_file(args: argparse.Namespace) -> int:
                         f"head_group={args.head_group} token_start={page.index * args.tokens_per_page} "
                         f"tokens={((page.length + args.bytes_per_token - 1) // args.bytes_per_token)} "
                         f"len={page.length} frags={hash_result.fragment_count} {status} "
-                        f"digest={hash_result.digest.hex()}"
+                        f"unique_block={unique_block.id} digest={hash_result.digest.hex()}"
                     )
 
             stats.elapsed_seconds = perf_counter() - start_total
@@ -1027,6 +1080,199 @@ def restore_kv(args: argparse.Namespace) -> int:
     return 0
 
 
+def load_kv_trace(trace_file: str | None, pages: list, repeat: int) -> list[KvTraceAccess]:
+    if repeat <= 0:
+        raise ValueError("repeat must be > 0")
+    if trace_file is None:
+        accesses: list[KvTraceAccess] = []
+        step = 0
+        for _ in range(repeat):
+            for page in pages:
+                accesses.append(KvTraceAccess(step=step, page_index=page.page_index))
+                step += 1
+        return accesses
+
+    path = Path(trace_file).resolve()
+    if path.suffix.lower() == ".json":
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        accesses = []
+        for idx, item in enumerate(raw):
+            if isinstance(item, int):
+                accesses.append(KvTraceAccess(step=idx, page_index=item))
+            else:
+                accesses.append(
+                    KvTraceAccess(
+                        step=int(item.get("step", idx)),
+                        page_index=int(item["page_index"]),
+                        request_id=item.get("request_id"),
+                    )
+                )
+        return accesses
+
+    accesses = []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for idx, row in enumerate(reader):
+            accesses.append(
+                KvTraceAccess(
+                    step=int(row.get("step") or idx),
+                    page_index=int(row["page_index"]),
+                    request_id=row.get("request_id") or None,
+                )
+            )
+    return accesses
+
+
+def kv_hot_score(policy: str, access_count: int, ref_count: int, last_access_step: int, current_step: int) -> float:
+    age = max(0, current_step - last_access_step)
+    if policy == "lru":
+        return float(last_access_step)
+    if policy == "lfu":
+        return float(access_count)
+    return access_count * 4.0 + ref_count * 1.5 + last_access_step * 0.05 - age * 0.02
+
+
+def simulate_kv_runtime(args: argparse.Namespace) -> int:
+    if args.cache_pages <= 0:
+        raise ValueError("cache-pages must be > 0")
+    if args.hot_refresh_interval <= 0:
+        raise ValueError("hot-refresh-interval must be > 0")
+    if args.run_id is None and args.request_id is None:
+        raise SystemExit("simulate-kv-runtime requires --run-id or --request-id")
+    if args.run_id is not None and args.request_id is not None:
+        raise SystemExit("use only one of --run-id or --request-id")
+
+    db = FingerprintDb(args.db_path)
+    try:
+        if args.run_id is not None:
+            kv_run = db.get_kv_run(args.run_id)
+        else:
+            kv_run = db.get_latest_kv_run(args.request_id)
+        pages = db.get_kv_pages(kv_run.id)
+        if not pages:
+            raise ValueError(f"KV run {kv_run.id} has no pages")
+
+        page_by_index = {page.page_index: page for page in pages}
+        block_by_page: dict[int, object] = {}
+        for page in pages:
+            if page.unique_block_id is not None:
+                block = db.get_unique_kv_block(page.unique_block_id)
+            else:
+                block = db.get_unique_kv_block_by_digest(page.digest)
+                if block is None:
+                    block = db.record_unique_kv_block(
+                        digest=page.digest,
+                        block_length=page.page_length,
+                        dtype="unknown",
+                        shape="migrated_from_kv_pages",
+                    )
+            block_by_page[page.page_index] = block
+
+        accesses = load_kv_trace(args.trace_file, pages, args.repeat)
+        cache: dict[int, dict[str, object]] = {}
+        block_stats: dict[int, dict[str, object]] = {}
+        for block in block_by_page.values():
+            block_stats[block.id] = {
+                "digest": block.digest,
+                "ref_count": block.ref_count,
+                "access_count": 0,
+                "last_access_step": 0,
+                "hot_score": block.hot_score,
+            }
+
+        stats = KvRuntimeSimStats()
+        fpga_hot_digests: set[bytes] = set()
+
+        for access in accesses:
+            if access.page_index not in page_by_index:
+                raise KeyError(f"trace references missing page_index {access.page_index}")
+            block = block_by_page[access.page_index]
+
+            if stats.accesses % args.hot_refresh_interval == 0:
+                ranked = sorted(
+                    block_stats.values(),
+                    key=lambda item: (float(item["hot_score"]), int(item["ref_count"])),
+                    reverse=True,
+                )
+                fpga_hot_digests = {
+                    bytes(item["digest"]) for item in ranked[: args.fpga_hot_limit]
+                }
+                stats.hot_table_refreshes += 1
+
+            cache_hit = block.id in cache
+            fpga_hot_hit = block.digest in fpga_hot_digests
+            if cache_hit:
+                stats.cache_hits += 1
+            else:
+                stats.cold_restores += 1
+                if len(cache) >= args.cache_pages:
+                    victim_id, _victim = min(
+                        cache.items(),
+                        key=lambda item: float(item[1]["hot_score"]),
+                    )
+                    del cache[victim_id]
+                    stats.evictions += 1
+
+            if fpga_hot_hit:
+                stats.fpga_hot_hits += 1
+
+            item = block_stats[block.id]
+            access_count = int(item["access_count"]) + 1
+            score = kv_hot_score(
+                args.policy,
+                access_count=access_count,
+                ref_count=int(item["ref_count"]),
+                last_access_step=int(item["last_access_step"]),
+                current_step=access.step,
+            )
+            item["access_count"] = access_count
+            item["last_access_step"] = access.step
+            item["hot_score"] = score
+            cache[block.id] = {
+                "digest": block.digest,
+                "access_count": access_count,
+                "last_access_step": access.step,
+                "hot_score": score,
+            }
+            db.record_kv_access(
+                step=access.step,
+                request_id=access.request_id or kv_run.request_id,
+                run_id=kv_run.id,
+                page_index=access.page_index,
+                unique_block_id=block.id,
+                cache_hit=cache_hit,
+                fpga_hot_hit=fpga_hot_hit,
+                policy=args.policy,
+                hot_score=score,
+            )
+            stats.accesses += 1
+
+            if args.print_accesses:
+                location = "HOST_CACHE" if cache_hit else "COLD_FILE"
+                print(
+                    f"step={access.step:06d} page={access.page_index:04d} "
+                    f"unique_block={block.id} {location} "
+                    f"fpga_hot={'hit' if fpga_hot_hit else 'miss'} score={score:.3f}"
+                )
+    finally:
+        db.close()
+
+    print(f"kv_run              {kv_run.id}")
+    print(f"request_id          {kv_run.request_id}")
+    print(f"policy              {args.policy}")
+    print(f"cache_pages         {args.cache_pages}")
+    print(f"fpga_hot_limit      {args.fpga_hot_limit}")
+    print(f"accesses            {stats.accesses}")
+    print(f"cache_hits          {stats.cache_hits}")
+    print(f"cold_restores       {stats.cold_restores}")
+    print(f"evictions           {stats.evictions}")
+    print(f"cache_hit_ratio     {stats.cache_hit_ratio:.4f}")
+    print(f"fpga_hot_hits       {stats.fpga_hot_hits}")
+    print(f"fpga_hot_hit_ratio  {stats.fpga_hot_hit_ratio:.4f}")
+    print(f"hot_refreshes       {stats.hot_table_refreshes}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -1049,5 +1295,7 @@ def main(argv: list[str] | None = None) -> int:
         return process_kv_file(args)
     if args.command == "restore-kv":
         return restore_kv(args)
+    if args.command == "simulate-kv-runtime":
+        return simulate_kv_runtime(args)
     parser.error(f"unsupported command: {args.command}")
     return 2

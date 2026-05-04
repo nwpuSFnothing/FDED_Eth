@@ -49,6 +49,20 @@ class KvPage:
     token_count: int
     page_length: int
     digest: bytes
+    unique_block_id: int | None = None
+
+
+@dataclass(frozen=True)
+class UniqueKvBlock:
+    id: int
+    digest: bytes
+    block_length: int
+    dtype: str
+    shape: str
+    ref_count: int
+    location: str
+    hot_score: float
+    last_access_step: int
 
 
 class FingerprintDb:
@@ -144,10 +158,47 @@ class FingerprintDb:
                 shape TEXT NOT NULL,
                 page_length INTEGER NOT NULL,
                 digest BLOB NOT NULL,
+                unique_block_id INTEGER,
                 is_duplicate INTEGER NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(run_id) REFERENCES kv_runs(id),
-                FOREIGN KEY(digest) REFERENCES fingerprints(digest)
+                FOREIGN KEY(digest) REFERENCES fingerprints(digest),
+                FOREIGN KEY(unique_block_id) REFERENCES unique_kv_blocks(id)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS unique_kv_blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                digest BLOB NOT NULL UNIQUE,
+                block_length INTEGER NOT NULL,
+                dtype TEXT NOT NULL,
+                shape TEXT NOT NULL,
+                ref_count INTEGER NOT NULL DEFAULT 1,
+                location TEXT NOT NULL DEFAULT 'COLD_FILE',
+                hot_score REAL NOT NULL DEFAULT 0.0,
+                last_access_step INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kv_access_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                step INTEGER NOT NULL,
+                request_id TEXT NOT NULL,
+                run_id INTEGER,
+                page_index INTEGER NOT NULL,
+                unique_block_id INTEGER NOT NULL,
+                cache_hit INTEGER NOT NULL,
+                fpga_hot_hit INTEGER NOT NULL,
+                policy TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(run_id) REFERENCES kv_runs(id),
+                FOREIGN KEY(unique_block_id) REFERENCES unique_kv_blocks(id)
             )
             """
         )
@@ -157,6 +208,12 @@ class FingerprintDb:
         }
         if "run_id" not in columns:
             self.conn.execute("ALTER TABLE chunk_events ADD COLUMN run_id INTEGER")
+        kv_page_columns = {
+            str(row[1])
+            for row in self.conn.execute("PRAGMA table_info(kv_pages)").fetchall()
+        }
+        if "unique_block_id" not in kv_page_columns:
+            self.conn.execute("ALTER TABLE kv_pages ADD COLUMN unique_block_id INTEGER")
         self.conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_chunk_events_run_order
@@ -179,6 +236,18 @@ class FingerprintDb:
             """
             CREATE INDEX IF NOT EXISTS idx_kv_runs_request_created
             ON kv_runs(request_id, created_at)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_unique_kv_blocks_score
+            ON unique_kv_blocks(hot_score DESC, ref_count DESC, last_access_step DESC)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_kv_access_events_order
+            ON kv_access_events(step, request_id, page_index)
             """
         )
         self.conn.commit()
@@ -455,14 +524,15 @@ class FingerprintDb:
         page_length: int,
         digest: bytes,
         is_duplicate: bool,
+        unique_block_id: int | None = None,
     ) -> None:
         self.conn.execute(
             """
             INSERT INTO kv_pages (
                 run_id, request_id, model_id, layer_id, kv_kind, head_group,
                 page_index, token_start, token_count, dtype, shape,
-                page_length, digest, is_duplicate
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                page_length, digest, unique_block_id, is_duplicate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -478,10 +548,172 @@ class FingerprintDb:
                 shape,
                 page_length,
                 digest,
+                unique_block_id,
                 int(is_duplicate),
             ),
         )
         self.conn.commit()
+
+    def record_unique_kv_block(
+        self,
+        digest: bytes,
+        block_length: int,
+        dtype: str,
+        shape: str,
+    ) -> UniqueKvBlock:
+        row = self.conn.execute(
+            """
+            SELECT id, block_length, dtype, shape, ref_count, location, hot_score, last_access_step
+            FROM unique_kv_blocks
+            WHERE digest = ?
+            """,
+            (digest,),
+        ).fetchone()
+        if row is None:
+            cursor = self.conn.execute(
+                """
+                INSERT INTO unique_kv_blocks (
+                    digest, block_length, dtype, shape, ref_count
+                ) VALUES (?, ?, ?, ?, 1)
+                """,
+                (digest, block_length, dtype, shape),
+            )
+            self.conn.commit()
+            return UniqueKvBlock(
+                id=int(cursor.lastrowid),
+                digest=digest,
+                block_length=block_length,
+                dtype=dtype,
+                shape=shape,
+                ref_count=1,
+                location="COLD_FILE",
+                hot_score=0.0,
+                last_access_step=0,
+            )
+
+        ref_count = int(row[4]) + 1
+        self.conn.execute(
+            """
+            UPDATE unique_kv_blocks
+            SET ref_count = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (ref_count, int(row[0])),
+        )
+        self.conn.commit()
+        return UniqueKvBlock(
+            id=int(row[0]),
+            digest=digest,
+            block_length=int(row[1]),
+            dtype=str(row[2]),
+            shape=str(row[3]),
+            ref_count=ref_count,
+            location=str(row[5]),
+            hot_score=float(row[6]),
+            last_access_step=int(row[7]),
+        )
+
+    def get_unique_kv_block(self, unique_block_id: int) -> UniqueKvBlock:
+        row = self.conn.execute(
+            """
+            SELECT id, digest, block_length, dtype, shape, ref_count,
+                   location, hot_score, last_access_step
+            FROM unique_kv_blocks
+            WHERE id = ?
+            """,
+            (unique_block_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"no unique KV block with id {unique_block_id}")
+        return UniqueKvBlock(
+            id=int(row[0]),
+            digest=bytes(row[1]),
+            block_length=int(row[2]),
+            dtype=str(row[3]),
+            shape=str(row[4]),
+            ref_count=int(row[5]),
+            location=str(row[6]),
+            hot_score=float(row[7]),
+            last_access_step=int(row[8]),
+        )
+
+    def get_unique_kv_block_by_digest(self, digest: bytes) -> UniqueKvBlock | None:
+        row = self.conn.execute(
+            """
+            SELECT id, digest, block_length, dtype, shape, ref_count,
+                   location, hot_score, last_access_step
+            FROM unique_kv_blocks
+            WHERE digest = ?
+            """,
+            (digest,),
+        ).fetchone()
+        if row is None:
+            return None
+        return UniqueKvBlock(
+            id=int(row[0]),
+            digest=bytes(row[1]),
+            block_length=int(row[2]),
+            dtype=str(row[3]),
+            shape=str(row[4]),
+            ref_count=int(row[5]),
+            location=str(row[6]),
+            hot_score=float(row[7]),
+            last_access_step=int(row[8]),
+        )
+
+    def record_kv_access(
+        self,
+        step: int,
+        request_id: str,
+        run_id: int | None,
+        page_index: int,
+        unique_block_id: int,
+        cache_hit: bool,
+        fpga_hot_hit: bool,
+        policy: str,
+        hot_score: float,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO kv_access_events (
+                step, request_id, run_id, page_index, unique_block_id,
+                cache_hit, fpga_hot_hit, policy
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                step,
+                request_id,
+                run_id,
+                page_index,
+                unique_block_id,
+                int(cache_hit),
+                int(fpga_hot_hit),
+                policy,
+            ),
+        )
+        self.conn.execute(
+            """
+            UPDATE unique_kv_blocks
+            SET hot_score = ?, last_access_step = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (hot_score, step, unique_block_id),
+        )
+        self.conn.commit()
+
+    def get_hot_kv_digests(self, limit: int) -> list[tuple[bytes, int, float]]:
+        if limit <= 0:
+            return []
+        rows = self.conn.execute(
+            """
+            SELECT digest, ref_count, hot_score
+            FROM unique_kv_blocks
+            ORDER BY hot_score DESC, ref_count DESC, last_access_step DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [(bytes(row[0]), int(row[1]), float(row[2])) for row in rows]
 
     def get_kv_run(self, run_id: int) -> KvRun:
         row = self.conn.execute(
@@ -536,7 +768,7 @@ class FingerprintDb:
     def get_kv_pages(self, run_id: int) -> list[KvPage]:
         rows = self.conn.execute(
             """
-            SELECT page_index, token_start, token_count, page_length, digest
+            SELECT page_index, token_start, token_count, page_length, digest, unique_block_id
             FROM kv_pages
             WHERE run_id = ?
             ORDER BY page_index ASC
@@ -550,6 +782,7 @@ class FingerprintDb:
                 token_count=int(row[2]),
                 page_length=int(row[3]),
                 digest=bytes(row[4]),
+                unique_block_id=None if row[5] is None else int(row[5]),
             )
             for row in rows
         ]
