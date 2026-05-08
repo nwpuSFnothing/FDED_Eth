@@ -14,6 +14,8 @@ module mac_top
          input  [7:0]         TTL,
          input  [31:0]        source_ip_addr,
          input  [31:0]        destination_ip_addr,
+         input  [47:0]        destination_mac_addr_direct,
+         input                destination_mac_addr_direct_en,
          input  [15:0]        udp_send_source_port,
          input  [15:0]        udp_send_destination_port,
          
@@ -36,6 +38,9 @@ module mac_top
          output [7:0]         udp_rec_ram_rdata ,
          input  [10:0]        udp_rec_ram_read_addr,
          output [15:0]        udp_rec_data_length,
+         output [15:0]        udp_rec_source_port,
+         output [31:0]        udp_rec_source_ip_addr,
+         output [47:0]        udp_rec_source_mac_addr,
          output               udp_rec_data_valid,
          
          output               arp_found,
@@ -49,6 +54,7 @@ wire                  arp_reply_req ;
 wire  [31:0]          arp_rec_source_ip_addr ;
 wire  [47:0]          arp_rec_source_mac_addr ;
 wire   [47:0]         destination_mac_addr ;
+wire   [47:0]         destination_mac_addr_mux ;
 
 wire [7:0]            mac_rx_dataout ;
 wire [15:0]           upper_layer_data_length ;
@@ -62,12 +68,16 @@ wire                  icmp_tx_req ;
 wire                  icmp_tx_ack ;
 wire [15:0]           icmp_send_data_length ;
 
+assign destination_mac_addr_mux = destination_mac_addr_direct_en ?
+                                  destination_mac_addr_direct :
+                                  destination_mac_addr ;
+
 mac_tx_top mac_tx0
            (
             .clk                         (gmii_tx_clk)                  ,
             .rst_n                       (rst_n)  ,
             
-            .destination_mac_addr        (destination_mac_addr)   , //destination mac address
+            .destination_mac_addr        (destination_mac_addr_mux)   , //destination mac address
             .source_mac_addr             (source_mac_addr)   ,       //source mac address
             .TTL                         (TTL),
             .source_ip_addr              (source_ip_addr),
@@ -127,6 +137,9 @@ mac_rx_top mac_rx0
             .udp_rec_ram_rdata        (udp_rec_ram_rdata),
             .udp_rec_ram_read_addr    (udp_rec_ram_read_addr),
             .udp_rec_data_length      (udp_rec_data_length ),
+            .udp_rec_source_port      (udp_rec_source_port ),
+            .udp_rec_source_ip_addr   (udp_rec_source_ip_addr ),
+            .udp_rec_source_mac_addr  (udp_rec_source_mac_addr ),
             .udp_rec_data_valid       (udp_rec_data_valid),
             
             .mac_rx_dataout           (mac_rx_dataout ),

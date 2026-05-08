@@ -23,6 +23,7 @@ module udp_rx
  output     [7:0]       udp_rec_ram_rdata ,      //udp ram read data
  input      [10:0]      udp_rec_ram_read_addr,   //udp ram read address
  output reg [15:0]      udp_rec_data_length,     //udp data length
+ output reg [15:0]      udp_rec_source_port,
  output reg             udp_rec_data_valid       //udp data valid
 );
 
@@ -165,6 +166,16 @@ begin
     udp_rec_data_length <= 16'd0 ;
   else if (state == REC_END)
     udp_rec_data_length <= udp_data_length ;
+end
+
+always @(posedge clk or negedge rst_n)
+begin
+  if (~rst_n)
+    udp_rec_source_port <= 16'd0 ;
+  else if (state == REC_HEAD && udp_rx_cnt == 16'd0)
+    udp_rec_source_port[15:8] <= udp_rx_data ;
+  else if (state == REC_HEAD && udp_rx_cnt == 16'd1)
+    udp_rec_source_port[7:0] <= udp_rx_data ;
 end
 
 always @(posedge clk or negedge rst_n)

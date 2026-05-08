@@ -28,6 +28,9 @@ wire                 arp_request_req ;
 wire                 mac_send_end ;
 wire [7:0]           udp_rec_ram_rdata ;
 wire [15:0]          udp_rec_data_length ;
+wire [15:0]          udp_rec_source_port ;
+wire [31:0]          udp_rec_source_ip_addr ;
+wire [47:0]          udp_rec_source_mac_addr ;
 wire                 udp_rec_data_valid ;
 wire                 udp_tx_end ;
 wire                 almost_full ;
@@ -42,6 +45,10 @@ reg   [31:0]         seq_id_buf_tx ;
 reg   [255:0]        hash_digest_buf_tx ;
 reg                  hash_error_buf_tx ;
 reg   [7:0]          hash_status_buf_tx ;
+reg   [15:0]         reply_destination_port_tx ;
+reg   [31:0]         reply_destination_ip_tx ;
+reg   [47:0]         reply_destination_mac_tx ;
+reg                  reply_destination_valid_tx ;
 reg   [5:0]          hash_write_cnt ;
 reg                  almost_full_d0 ;
 reg                  almost_full_d1 ;
@@ -49,9 +56,15 @@ reg                  almost_full_d1 ;
 reg                  udp_rec_data_valid_d0_rx ;
 reg                  hash_start_rx ;
 reg   [15:0]         reply_payload_len_rx ;
+reg   [15:0]         request_source_port_rx ;
+reg   [31:0]         request_source_ip_rx ;
+reg   [47:0]         request_source_mac_rx ;
 
 reg   [31:0]         result_seq_id_rx ;
 reg   [255:0]        result_digest_rx ;
+reg   [15:0]         result_source_port_rx ;
+reg   [31:0]         result_source_ip_rx ;
+reg   [47:0]         result_source_mac_rx ;
 reg                  result_hot_hit_rx ;
 reg                  result_stream_ack_rx ;
 reg                  result_error_rx ;
@@ -127,7 +140,7 @@ always @(*)
 
       CHECK_ARP:
         begin
-          if (mac_not_exist)
+          if (mac_not_exist && ~reply_destination_valid_tx)
             next_state <= ARP_REQ ;
           else if (almost_full_d1)
             next_state <= CHECK_ARP ;
@@ -191,8 +204,14 @@ always@(posedge gmii_rx_clk or negedge rst_n)
         udp_rec_data_valid_d0_rx <= 1'b0 ;
         hash_start_rx            <= 1'b0 ;
         reply_payload_len_rx     <= 16'd0 ;
+        request_source_port_rx   <= 16'd0 ;
+        request_source_ip_rx     <= 32'd0 ;
+        request_source_mac_rx    <= 48'd0 ;
         result_seq_id_rx         <= 32'd0 ;
         result_digest_rx         <= 256'd0 ;
+        result_source_port_rx    <= 16'd0 ;
+        result_source_ip_rx      <= 32'd0 ;
+        result_source_mac_rx     <= 48'd0 ;
         result_hot_hit_rx        <= 1'b0 ;
         result_stream_ack_rx     <= 1'b0 ;
         result_error_rx          <= 1'b0 ;
@@ -214,6 +233,9 @@ always@(posedge gmii_rx_clk or negedge rst_n)
         if (udp_rec_data_valid && ~udp_rec_data_valid_d0_rx && ~sha_busy)
           begin
             reply_payload_len_rx <= udp_rec_data_length - 16'd8 ;
+            request_source_port_rx <= udp_rec_source_port ;
+            request_source_ip_rx <= udp_rec_source_ip_addr ;
+            request_source_mac_rx <= udp_rec_source_mac_addr ;
             hash_start_rx <= 1'b1 ;
           end
 
@@ -221,6 +243,9 @@ always@(posedge gmii_rx_clk or negedge rst_n)
           begin
             result_seq_id_rx <= sha_seq_id ;
             result_digest_rx <= sha_digest ;
+            result_source_port_rx <= request_source_port_rx ;
+            result_source_ip_rx <= request_source_ip_rx ;
+            result_source_mac_rx <= request_source_mac_rx ;
             result_hot_hit_rx <= sha_hot_hit ;
             result_stream_ack_rx <= sha_stream_ack ;
             result_error_rx  <= sha_error ;
@@ -239,6 +264,10 @@ always@(posedge gmii_tx_clk or negedge rst_n)
         hash_digest_buf_tx    <= 256'd0 ;
         hash_error_buf_tx     <= 1'b0 ;
         hash_status_buf_tx    <= 8'h00 ;
+        reply_destination_port_tx  <= 16'h1f90 ;
+        reply_destination_ip_tx    <= 32'hc0a80003 ;
+        reply_destination_mac_tx   <= 48'hff_ff_ff_ff_ff_ff ;
+        reply_destination_valid_tx <= 1'b0 ;
         result_toggle_tx_d0   <= 1'b0 ;
         result_toggle_tx_d1   <= 1'b0 ;
         result_ack_toggle_tx  <= 1'b0 ;
@@ -255,6 +284,10 @@ always@(posedge gmii_tx_clk or negedge rst_n)
           begin
             seq_id_buf_tx        <= result_seq_id_rx ;
             hash_digest_buf_tx   <= result_digest_rx ;
+            reply_destination_port_tx <= result_source_port_rx ;
+            reply_destination_ip_tx <= result_source_ip_rx ;
+            reply_destination_mac_tx <= result_source_mac_rx ;
+            reply_destination_valid_tx <= 1'b1 ;
             hash_error_buf_tx    <= result_error_rx ;
             hash_status_buf_tx   <= result_error_rx ? 8'h80 :
                                     (result_stream_ack_rx ? 8'h02 :
@@ -390,9 +423,11 @@ mac_top mac_top0
  .source_mac_addr             (48'h00_0a_35_01_fe_c0)   ,
  .TTL                         (8'h80),
  .source_ip_addr              (32'hc0a80002),
- .destination_ip_addr         (32'hc0a80003),
+ .destination_ip_addr         (reply_destination_ip_tx),
+ .destination_mac_addr_direct (reply_destination_mac_tx),
+ .destination_mac_addr_direct_en (reply_destination_valid_tx),
  .udp_send_source_port        (16'h1f90),
- .udp_send_destination_port   (16'h1f90),
+ .udp_send_destination_port   (reply_destination_port_tx),
 
  .ram_wr_data                 (ram_wr_data) ,
  .ram_wr_en                   (ram_wr_en),
@@ -413,6 +448,9 @@ mac_top mac_top0
  .udp_rec_ram_rdata           (udp_rec_ram_rdata),
  .udp_rec_ram_read_addr       (udp_rec_ram_read_addr),
  .udp_rec_data_length         (udp_rec_data_length ),
+ .udp_rec_source_port         (udp_rec_source_port ),
+ .udp_rec_source_ip_addr      (udp_rec_source_ip_addr ),
+ .udp_rec_source_mac_addr     (udp_rec_source_mac_addr ),
 
  .udp_rec_data_valid          (udp_rec_data_valid),
  .arp_found                   (arp_found ),

@@ -24,7 +24,10 @@ module mac_rx_top
  output [7:0]           udp_rec_ram_rdata ,  
  input  [10:0]          udp_rec_ram_read_addr,
  output [15:0]          udp_rec_data_length,
+ output [15:0]          udp_rec_source_port,
  output                 udp_rec_data_valid,
+ output [31:0]          udp_rec_source_ip_addr,
+ output [47:0]          udp_rec_source_mac_addr,
  
  output [7:0]           mac_rx_dataout,
  output [15:0]          upper_layer_data_length ,
@@ -63,6 +66,8 @@ wire [31:0]             crc_result ;
 
 
 assign  icmp_rev_error = (mac_rec_error | ip_checksum_error | ip_addr_check_error)  ;
+assign  udp_rec_source_ip_addr = ip_rec_source_ip_addr ;
+assign  udp_rec_source_mac_addr = mac_rx_source_mac_addr ;
 
 
 crc c0
@@ -154,6 +159,7 @@ ip_rx ip0
  .udp_rec_ram_rdata             (udp_rec_ram_rdata),  
  .udp_rec_ram_read_addr         (udp_rec_ram_read_addr),
  .udp_rec_data_length           (udp_rec_data_length ),
+ .udp_rec_source_port           (udp_rec_source_port ),
       
  .udp_rec_data_valid            (udp_rec_data_valid)
 );
